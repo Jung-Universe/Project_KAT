@@ -1289,8 +1289,8 @@ bool AP_Arming::can_checks(bool report)
                 case AP_CAN::Protocol::Scripting:
                 case AP_CAN::Protocol::Scripting2:
                 case AP_CAN::Protocol::KDECAN:
-
-                    break;
+                case AP_CAN::Protocol::MTCAN:
+    			break;
             }
         }
     }

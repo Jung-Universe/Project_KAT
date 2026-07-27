@@ -62,6 +62,9 @@ public:
         // 8 reserved for SBG
         // 9 reserved for EulerNav
         // 10 reserved for Aeron
+
+        // Custom Xsens MTi-680G/MTi-689G CAN IMU-only backend.
+        MTCAN = 12,   //-> Mission planner parameter에서 "EAHRS_TYPE = 12"선택하면 MTCAN backend를 구분하기 위한 번호임.
     };
 
     static AP_ExternalAHRS *get_singleton(void) {
@@ -150,13 +153,13 @@ public:
         float vdop;
         int32_t  longitude;
         int32_t  latitude;
-        int32_t  msl_altitude;       // cm
+        int32_t  msl_altitude;       
         float  ned_vel_north;
         float  ned_vel_east;
         float  ned_vel_down;
     } gps_data_message_t;
 
-    typedef struct {
+    typedef struct { ////////////
         Vector3f accel;
         Vector3f gyro;
         float temperature;
@@ -211,4 +214,3 @@ namespace AP {
 };
 
 #endif  // HAL_EXTERNAL_AHRS_ENABLED
-

@@ -26,6 +26,7 @@
 #include "AP_ExternalAHRS_MicroStrain5.h"
 #include "AP_ExternalAHRS_MicroStrain7.h"
 #include "AP_ExternalAHRS_InertialLabs.h"
+#include "AP_ExternalAHRS_MTCAN.h"
 
 #include <GCS_MAVLink/GCS.h>
 #include <AP_AHRS/AP_AHRS.h>
@@ -58,7 +59,7 @@ const AP_Param::GroupInfo AP_ExternalAHRS::var_info[] = {
     // @Param: _TYPE
     // @DisplayName: AHRS type
     // @Description: Type of AHRS device
-    // @Values: 0:None,1:VectorNav,2:MicroStrain5,5:InertialLabs,7:MicroStrain7
+    // @Values: 0:None,1:VectorNav,2:MicroStrain5,5:InertialLabs,7:MicroStrain7,12:MTCAN
     // @User: Standard
     AP_GROUPINFO_FLAGS("_TYPE", 1, AP_ExternalAHRS, devtype, HAL_EXTERNAL_AHRS_DEFAULT, AP_PARAM_FLAG_ENABLE),
 
@@ -130,6 +131,9 @@ void AP_ExternalAHRS::init(void)
         return;
 #endif
 
+    case DevType::MTCAN:
+        backend = NEW_NOTHROW AP_ExternalAHRS_MTCAN(this, state);
+        return;
     }
 
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Unsupported ExternalAHRS type %u", unsigned(devtype));
@@ -271,9 +275,12 @@ bool AP_ExternalAHRS::pre_arm_check(char *failure_msg, uint8_t failure_msg_len) 
         }
     }
 
-    if (!state.have_origin) {
+    // An IMU-only MTCAN backend neither supplies nor requires an ExternalAHRS
+    // navigation origin. Keep the original origin check for GPS-producing
+    // ExternalAHRS backends.
+    if (has_sensor(AvailableSensor::GPS) && !state.have_origin) {
         hal.util->snprintf(failure_msg, failure_msg_len, "ExternalAHRS: No origin");
-	    return false;
+        return false;
     }
     return true;
 }
@@ -460,4 +467,3 @@ AP_ExternalAHRS &externalAHRS()
 };
 
 #endif  // HAL_EXTERNAL_AHRS_ENABLED
-

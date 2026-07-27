@@ -311,3 +311,6 @@ define HAL_IMU_TEMP_DEFAULT 45
 # Enable Sagetech MXS ADSB transponder
 define HAL_ADSB_SAGETECH_MXS_ENABLED HAL_ADSB_ENABLED
 
+# Enable ExternalAHRS backend for MTCAN   ///for MTCAN ExternalAHRS
+define HAL_EXTERNAL_AHRS_ENABLED 1
+

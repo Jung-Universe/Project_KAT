@@ -233,6 +233,13 @@ void AP_CANManager::init()
             AP_Param::load_object_from_eeprom((AP_PiccoloCAN*)_drivers[drv_num], AP_PiccoloCAN::var_info);
             break;
 #endif
+        case AP_CAN::Protocol::MTCAN:
+            // MTCAN is implemented as a CANSensor-backed ExternalAHRS
+            // backend. The physical CAN interface has already been
+            // initialised above. Leave this virtual driver slot empty so
+            // AP_ExternalAHRS_MTCAN can register itself later through
+            // AP_CANManager::register_driver().
+            continue;
         default:
             continue;
         }
@@ -778,4 +785,3 @@ AP_CANManager& AP::can()
 }
 
 #endif
-
