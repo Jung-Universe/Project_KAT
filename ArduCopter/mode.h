@@ -100,6 +100,7 @@ public:
         AUTOROTATE =   26,  // Autonomous autorotation
         AUTO_RTL =     27,  // Auto RTL, this is not a true mode, AUTO will report as this mode if entered to perform a DO_LAND_START Landing sequence
         TURTLE =       28,  // Flip over after crash
+        TDCN =         29,  /* Sejong */ // external CLAW controller drives the vehicle (shipboard landing)
 
         // Mode number 127 reserved for the "drone show mode" in the Skybrush
         // fork at https://github.com/skybrush-io/ardupilot
@@ -1822,6 +1823,153 @@ private:
     float motors_output;
     Vector2f motors_input;
     uint32_t last_throttle_warning_output_ms;
+};
+#endif
+
+#if MODE_TDCN_ENABLED
+/* Sejong */
+// TDCN integrates the externally supplied CLAW controller
+// (mode_tdcn_CLAW_IBSC_ship_Fianl_NED.c).  Version 1 only monitors CLAW - its
+// control output is not applied to the vehicle.  Implementation: mode_tdcn.cpp
+class ModeTDCN : public Mode {
+
+public:
+    // inherit constructors
+    using Mode::Mode;
+    Number mode_number() const override { return Number::TDCN; }
+
+    // 시나리오 상태 - GCS 가 MAV_CMD_USER_1 param1 으로 보낸다
+    enum class State : uint8_t {
+        NONE          = 0,  // 아직 GCS 명령을 받지 못함
+        HANGAR_OPEN   = 1,  // 격납함 열기
+        TAKEOFF_WAIT  = 2,  // 이륙 대기
+        ARMED         = 3,  // ARMED
+        LAUNCH        = 4,  // 이륙 사출
+        FLIGHT_WAIT   = 5,  // 비행 대기
+        TRACKING      = 6,  // 추종 비행 (타겟 정보를 받는 유일한 상태)
+        LANDING_WAIT  = 7,  // 착륙 대기
+        LANDING_SYNC  = 8,  // 착륙 동기
+        LANDING_STOW  = 9,  // 착륙 수납
+        DISARMED      = 10, // DISARMED
+        HANGAR_CLOSE  = 11, // 격납함 닫기
+    };
+
+    bool init(bool ignore_checks) override;
+    void run() override;
+    void exit() override;
+
+    bool requires_GPS() const override { return true; }
+    bool has_manual_throttle() const override { return false; }
+    bool allows_arming(AP_Arming::Method method) const override { return true; }
+    bool is_autopilot() const override { return true; }
+
+    // 이륙/착륙 중인지를 ArduPilot 본체에 알려준다.  안 알려주면
+    //  - 이륙(state 4): land_detector 가 "착륙 상태인데 스로틀이 높다" 로 보고
+    //    INTERNAL_ERROR(flow_of_control) 를 기록한다.  이 내부 오류는 이후
+    //    prearm 을 영구히 막는다.
+    //  - 착륙(state 9): failsafe 가 착륙을 중단하고 RTL 로 바꿔버리고,
+    //    fence/throttle mix 도 착륙 상태를 반영하지 못한다.
+    bool is_taking_off() const override;
+    bool is_landing() const override;
+
+    // MAV_CMD_USER_1 수신 + 파싱.  GCS_Mavlink.cpp 가 호출한다.
+    //
+    // GCS::update_receive 는 메인 스레드 스케줄러 태스크이므로 run() 과 같은
+    // 스레드에서 돈다.  따라서 수신값을 따로 보관해 두고 run() 에서 꺼내 쓸
+    // 필요가 없고, 여기서 바로 파싱해도 안전하다 (락 불필요).
+    MAV_RESULT GCS_command(const mavlink_command_int_t &packet);
+
+    // state 번호에 대응하는 이름 (로그/GCS 메시지용)
+    static const char *state_name(State state);
+
+protected:
+    const char *name() const override { return "TDCN"; }
+    const char *name4() const override { return "TDCN"; }
+
+private:
+
+    // run() 2단계 - CLAW_U 에 기체 정보를 전달한다
+    void Update_Info_for_CLAW();
+
+    // CLAW 한 스텝 (home 갱신 -> 입력 전달 -> CLAW_step -> 출력 로깅).
+    // CLAW 를 돌려야 하는 state_*() 에서 호출한다.
+    void Run_CLAW();
+
+    // state 순서 가드.  GCS 가 순서를 건너뛰거나 현재 단계가 끝나기 전에
+    // 다음 번호를 보내는 것을 막는다.
+    static bool state_order_ok(State from, State to);   // 번호 순서가 맞는가
+
+    // CLAW 출력 모니터링.  CLAW_step() 직후에 호출한다.
+    void Log_Write_TDCN();
+
+    void state_hangar_open();       // 1
+    void state_takeoff_wait();      // 2
+    void state_armed();             // 3
+    void state_launch();            // 4
+    void state_flight_wait();       // 5
+    void state_tracking();          // 6
+    void state_landing_wait();      // 7
+    void state_landing_sync();      // 8
+    void state_landing_stow();      // 9
+    void state_disarmed();          // 10
+    void state_hangar_close();      // 11
+
+    State _state;                   // 현재 시나리오 상태
+
+    // state 진입 훅.  run() 의 case 문이 매 루프 state_*() 를 호출하므로,
+    // "방금 진입" 과 "계속 유지" 를 구분할 방법이 필요하다.
+    //   _state_entered   진입한 그 루프에만 true.  run() 끝에서 소비한다.
+    //                    한 번만 해야 하는 동작(격납함 열기 등)에 쓴다.
+    //   _state_start_ms  현재 state 에 들어온 시각.  경과시간 / 타임아웃에 쓴다.
+    bool _state_entered;
+    uint32_t _state_start_ms;
+
+    // 현재 state 가 할 일을 마쳤는가.  state 진입 시 false 로 내려가고,
+    // 각 state_*() 가 자기 완료 조건을 스스로 판단해 true 로 올린다.
+    // 이 값이 false 인 동안에는 다음 번호로 넘어갈 수 없다.
+    //
+    // 완료된 뒤에도 각 state_*() 는 자기 상태를 계속 유지한다.  조건이
+    // 흐트러지면 _state_done 이 다시 false 로 내려가고 그 함수가 복구를
+    // 시도한다 (예: DISARM_DELAY 로 무장이 풀리면 state 3 이 재무장).
+    bool _state_done;
+
+    // arm / disarm 재시도 시각.  두 함수 모두 체크를 전부 돌리고 결과를 GCS 에
+    // 출력하므로 400Hz 로 부를 수 없다.  한 번에 한 state 만 활성이라 공유한다.
+    uint32_t _action_retry_ms;
+
+    // state 3 - 직전 루프의 무장 상태.  무장 -> 해제로 떨어지는 순간을 잡아서
+    // 1Hz 재시도를 기다리지 않고 곧바로 다시 무장하기 위한 것이다.
+    bool _was_armed;
+
+    // 이륙 전 state (0~3) 의 기체 처리.  지상이면 안전 처리, 공중이면 제자리
+    // 유지.  비행 중에 TDCN 으로 모드를 바꿔도 기체가 가라앉지 않게 한다.
+    void preflight_vehicle_handling();
+
+    // 위 처리에서 잡을 위치를 이미 정했는가.  지상으로 내려오면 다시 내린다.
+    bool _air_hold_valid;
+
+    uint16_t _log_counter;          // 로그 데시메이션 카운터
+
+    // state 2 - 마지막으로 GCS 에 알린 pre-arm 결과.  400Hz 로 같은 내용을
+    // 반복해 보내지 않기 위해 결과가 바뀔 때만 알린다.
+    bool _prearm_ready;
+
+    // state 5 - 유지할 위치 (EKF origin 기준 NEU cm).  state 4 의 이륙 완료
+    // 위치를 잡아두고 계속 그 점을 명령한다.
+    Vector3p _hold_pos_neu_cm;
+
+    // state 6 - 추종할 타겟 위치 (EKF origin 기준 NEU cm).  GCS 가 준 위경도를
+    // 매 루프 변환해 넣는다.  변환 실패 시 마지막 값을 유지한다.
+    Vector3p _track_pos_neu_cm;
+
+    // 추종 비행(state 6) 타겟.  MAV_CMD_USER_1 수신값을 그대로 보관하고
+    // Update_Info_for_CLAW() 에서 CLAW_U.Dest_poti_i 로 변환 없이 전달한다.
+    // (heading 만 deg -> rad)
+    // 위경도는 Location 의 int32 (1e7 deg) 로 보관한다.  float 로 담으면
+    // 0.4~1.4 m 로 양자화되므로 COMMAND_INT 의 x/y 를 그대로 넣는다.
+    // 고도 기준(AltFrame)도 Location 이 함께 보유한다.
+    Location _target_loc;
+    float    _target_heading_deg;   // 진북 기준 (deg)
 };
 #endif
 

@@ -223,6 +223,7 @@ public:
     friend class ModeZigZag;
     friend class ModeAutorotate;
     friend class ModeTurtle;
+    friend class ModeTDCN;   /* Sejong */
 
     friend class _AutoTakeoff;
 
@@ -1071,6 +1072,10 @@ private:
 #endif
 #if MODE_TURTLE_ENABLED
     ModeTurtle mode_turtle;
+#endif
+#if MODE_TDCN_ENABLED
+    /* Sejong */
+    ModeTDCN mode_tdcn;
 #endif
 
     // mode.cpp

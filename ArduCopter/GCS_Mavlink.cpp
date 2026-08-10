@@ -775,6 +775,13 @@ MAV_RESULT GCS_MAVLINK_Copter::handle_command_int_packet(const mavlink_command_i
         return MAV_RESULT_DENIED;
 #endif
 
+#if MODE_TDCN_ENABLED
+    /* Sejong */
+    // TDCN 시나리오 상태 / 추종 비행 타겟 (GCS 모사 스크립트 tdcn_gcs.py)
+    case MAV_CMD_USER_1:
+        return copter.mode_tdcn.GCS_command(packet);
+#endif
+
     case MAV_CMD_DO_REPOSITION:
         return handle_command_int_do_reposition(packet);
 

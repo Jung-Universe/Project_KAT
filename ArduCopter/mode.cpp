@@ -179,6 +179,13 @@ Mode *Copter::mode_from_mode_num(const Mode::Number mode)
             break;
 #endif
 
+#if MODE_TDCN_ENABLED
+        /* Sejong */
+        case Mode::Number::TDCN:
+            ret = &mode_tdcn;
+            break;
+#endif
+
         default:
             break;
     }
