@@ -181,7 +181,7 @@ DEFAULT_SCENARIO: list[dict] = [
 class TdcnGCS:
     def __init__(self, device: str, target_system: int = 0,
                  target_component: int = 1, source_system: int = 254,
-                 ack_timeout: float = 2.0):
+                 ack_timeout: float = 2.0, verbose: bool = False):
         print(f"[link] connecting to {device} ...")
         self.master = mavutil.mavlink_connection(device,
                                                 source_system=source_system)
@@ -191,6 +191,7 @@ class TdcnGCS:
         self.target_system = target_system or self.master.target_system
         self.target_component = target_component
         self.ack_timeout = ack_timeout
+        self.verbose = verbose
         print(f"[link] connected — sysid={self.target_system} "
               f"compid={self.target_component}")
 
@@ -225,7 +226,9 @@ class TdcnGCS:
                     # 다음 단계로 넘어가도 되는지 판단하는 근거라 강조해 둔다.
                     if "TDCN" in msg.text:
                         print(f"\n  [기체] {msg.text}")
-                    else:
+                    elif self.verbose:
+                        # EKF/GPS 초기화 같은 기체 기본 메시지.  입력 프롬프트를
+                        # 덮어버리므로 --verbose 일 때만 보여준다.
                         print(f"\n[vehicle] {msg.text}")
 
     def close(self) -> None:
@@ -541,8 +544,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="TDCN GCS 모사 — MAV_CMD_USER_1 로 상태/타겟 전송",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--connect", "-c", default="tcp:127.0.0.1:5760",
-                    help="MAVLink 접속 문자열 (기본: tcp:127.0.0.1:5760)")
+    ap.add_argument("--connect", "-c", default="udp:127.0.0.1:14551",
+                    help="MAVLink 접속 문자열 (기본: udp:127.0.0.1:14551). "
+                         "14550 은 Mission Planner 몫이므로, SITL 을 "
+                         "--out=127.0.0.1:14551 로 띄워 이 포트를 열어둔다.")
     ap.add_argument("--sysid", type=int, default=0,
                     help="대상 system id (0 = heartbeat 에서 자동)")
     ap.add_argument("--compid", type=int, default=1, help="대상 component id")
@@ -572,6 +577,9 @@ def main() -> int:
                     help="시나리오 재생 후 종료 (FILE 생략 시 내장 기본값)")
     ap.add_argument("--list-states", action="store_true",
                     help="state 목록만 출력하고 종료")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="기체의 일반 STATUSTEXT(EKF/GPS 등)도 출력. "
+                         "기본은 TDCN 관련 메시지만 표시")
     args = ap.parse_args()
 
     if args.list_states:
@@ -584,7 +592,8 @@ def main() -> int:
     gcs = TdcnGCS(args.connect, target_system=args.sysid,
                   target_component=args.compid,
                   source_system=args.source_system,
-                  ack_timeout=args.ack_timeout)
+                  ack_timeout=args.ack_timeout,
+                  verbose=args.verbose)
     try:
         if args.scenario is not None:
             if args.scenario:
