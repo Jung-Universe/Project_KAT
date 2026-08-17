@@ -1831,12 +1831,54 @@ private:
 // TDCN integrates the externally supplied CLAW controller
 // (mode_tdcn_CLAW_IBSC_ship_Fianl_NED.c).  Version 1 only monitors CLAW - its
 // control output is not applied to the vehicle.  Implementation: mode_tdcn.cpp
+// CLAW 제어기 게인.
+//
+// 원래 mode_tdcn_CLAW_data_0729.c 에 상수로 박혀 있어 값을 바꾸려면 재빌드가
+// 필요했다.  파라미터로 빼서 미션플래너에서 CLAW_ 로 검색 / 조정할 수 있게 한다.
+// apply() 가 CLAW_step() 직전에 CLAW_P 로 복사하므로 바꾸면 즉시 반영된다.
+//
+// BSC_B_mat (제어효과 행렬) 은 제외했다.  기체 제원에서 나오는 값이고 48개짜리
+// 배열이라 파라미터로 낼 대상이 아니다.
+//
+// ModeTDCN 과 별도 그룹인 이유는 접두사 때문이다.  ModeTDCN 안에 두면 이름이
+// TDCN_CLAW_... 가 되어 16자(AP_MAX_NAME_SIZE) 를 넘긴다.
+class CLAW_Gains {
+public:
+    CLAW_Gains(void);
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    // 파라미터 값을 CLAW_P 로 옮긴다.  CLAW_step() 전에 부른다.
+    void apply(void) const;
+
+private:
+    AP_Float _scale_th, _scale_r, _scale_p, _scale_y;
+    AP_Float _k_pos_p, _k_pos_i, _k_vel_p, _k_vel_i;
+    AP_Float _awu_limit;
+    AP_Float _ome_xx, _ome_yy, _ome_zz, _ome_ph, _ome_th, _ome_ps;
+    AP_Float _zeta_xx, _zeta_yy, _zeta_zz, _zeta_ph, _zeta_th, _zeta_ps;
+    AP_Float _tau_hdot, _tau_r;
+};
+
 class ModeTDCN : public Mode {
 
 public:
+    ModeTDCN(void);
+
+    // CLAW 게인 파라미터.  ParametersG2 가 주소를 잡아야 해서 public 이다.
+    CLAW_Gains claw_gains;
+
+    // 믹서 직전 훅.  TDCN_CLAW_ON_OFF 가 1 이면 여기서 아두파일럿이 계산한
+    // 제어값을 CLAW 값으로 갈아끼운다.  Copter::motors_output() 이 부른다.
+    void output_to_motors() override;
+
     // inherit constructors
     using Mode::Mode;
     Number mode_number() const override { return Number::TDCN; }
+
+    // 파라미터 테이블.  ParametersG2 에 TDCN_ 접두사로 등록되어 미션플래너
+    // 파라미터 목록에서 검색 / 변경할 수 있다 (Parameters.cpp 의 var_info2).
+    static const struct AP_Param::GroupInfo var_info[];
 
     // 시나리오 상태 - GCS 가 MAV_CMD_USER_1 param1 으로 보낸다
     enum class State : uint8_t {
@@ -1941,6 +1983,17 @@ private:
     // 1Hz 재시도를 기다리지 않고 곧바로 다시 무장하기 위한 것이다.
     bool _was_armed;
 
+    // 무장이 걸린 시각.  run() 이 매 루프 해제->무장 엣지를 잡아 갱신한다.
+    // state 4 가 "무장한 지 얼마나 됐는가" 로 이륙 시작 시점을 미루는 데 쓴다.
+    // (_was_armed 는 state 3 전용이라 따로 둔다)
+    uint32_t _armed_ms;
+    bool     _armed_prev;
+
+    // state 4 - 이륙 시퀀스를 이미 시작했는가.
+    // _state_entered 는 run() 끝에서 소비되므로, 정착 대기로 한 루프라도
+    // 일찍 리턴하면 "진입" 정보가 사라진다.  그래서 별도 플래그로 들고 있는다.
+    bool _takeoff_started;
+
     // 이륙 전 state (0~3) 의 기체 처리.  지상이면 안전 처리, 공중이면 제자리
     // 유지.  비행 중에 TDCN 으로 모드를 바꿔도 기체가 가라앉지 않게 한다.
     void preflight_vehicle_handling();
@@ -1970,6 +2023,41 @@ private:
     // 고도 기준(AltFrame)도 Location 이 함께 보유한다.
     Location _target_loc;
     float    _target_heading_deg;   // 진북 기준 (deg)
+
+    // CLAW_step() 직전에 떠 두는 입력 스냅샷.
+    //
+    // "TDCN 이 넘긴 값" 과 "CLAW 가 내부에서 인식한 값" 을 비교하려면 넘긴 쪽을
+    // 그대로 들고 있어야 한다.  CLAW 는 home 래치 스텝에서 Dest_poti_i 를 현재
+    // 위치로 스스로 덮어쓰므로, CLAW_step() 뒤에 읽으면 넘긴 값이 아니게 된다.
+    //
+    // 고도는 넘길 때의 기준(up 양수) 그대로 담는다.  CLAW 는 안에서 down 으로
+    // 뒤집으므로, 로그로 남길 때 이쪽을 뒤집어 맞춘다.
+    double _in_cur_lat, _in_cur_lng, _in_cur_alt;   // deg, deg, m(up)
+    double _in_dst_lat, _in_dst_lng, _in_dst_alt;   // deg, deg, m(up)
+    double _in_vel_n, _in_vel_e, _in_vel_d;         // m/s, NED
+    float  _in_p, _in_q, _in_r;                     // rad/s, body FRD
+    float  _in_roll, _in_pitch, _in_yaw;            // rad
+    float  _in_ship_hdg;                            // rad, 진북
+
+    // --- 파라미터 ---
+    //
+    // 소스에 박아 두면 값을 바꿀 때마다 재빌드해야 하고, 실기체에서는 현장에서
+    // 조정할 수가 없다.  그래서 시나리오가 쓰는 고도 / 속도를 파라미터로 뺐다.
+    //
+    // state 6 의 추종 속도와 state 9 의 착륙 속도는 여기 없다.  각각
+    // WPNAV_SPEED / WPNAV_ACCEL 과 LAND_SPEED / LAND_ALT_LOW 를 그대로 쓰므로
+    // 이미 미션플래너에서 조절 가능하다.
+    AP_Float _takeoff_alt;      // state 4 이륙 목표 고도 (cm, home 기준 up)
+    AP_Float _takeoff_spd;      // state 4 상승 속도 (cm/s)
+    AP_Float _land_alt;         // state 8 착륙 동기 고도 (cm, home 기준 up)
+    AP_Float _land_spd;         // state 8 하강 속도 (cm/s)
+
+    // 0 = 아두파일럿이 몰고 CLAW 는 병렬 계산만 (v1)
+    // 1 = CLAW 의 제어값 4개를 믹서에 직접 넣는다 (v2)
+    AP_Int8  _claw_on_off;
+
+    // CLAW 출력을 믹서에 넣어도 되는 상태인가.  output_to_motors() 가 쓴다.
+    bool claw_output_active() const;
 };
 #endif
 

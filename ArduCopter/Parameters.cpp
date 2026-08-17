@@ -1233,6 +1233,16 @@ const AP_Param::GroupInfo ParametersG2::var_info2[] = {
     // @User: Advanced
     AP_GROUPINFO("FS_EKF_FILT", 8, ParametersG2, fs_ekf_filt_hz, FS_EKF_FILT_DEFAULT),
 
+#if MODE_TDCN_ENABLED
+    // @Group: TDCN_
+    // @Path: mode_tdcn.cpp
+    AP_SUBGROUPPTR(mode_tdcn_ptr, "TDCN_", 9, ParametersG2, ModeTDCN),
+
+    // @Group: CLAW_
+    // @Path: mode_tdcn.cpp
+    AP_SUBGROUPPTR(claw_gains_ptr, "CLAW_", 10, ParametersG2, CLAW_Gains),
+#endif
+
     // ID 62 is reserved for the AP_SUBGROUPEXTENSION
 
     AP_GROUPEND
@@ -1281,6 +1291,10 @@ ParametersG2::ParametersG2(void)
 #endif
 #if MODE_ZIGZAG_ENABLED
     ,mode_zigzag_ptr(&copter.mode_zigzag)
+#endif
+#if MODE_TDCN_ENABLED
+    ,mode_tdcn_ptr(&copter.mode_tdcn)
+    ,claw_gains_ptr(&copter.mode_tdcn.claw_gains)
 #endif
 
 #if MODE_ACRO_ENABLED || MODE_SPORT_ENABLED

@@ -54,11 +54,313 @@ extern bool home_init;
 // XTV[0..2] 는 TDCN 이 공급하는 EKF 속도이고, XTV[3..5] 는 CLAW 가 각속도에서
 // 직접 계산한다.
 extern double XTV[6];
+
+// CLAW 내부 상태.  진단 로그(TDC2)에만 쓴다.  CLAW.h 에 선언이 없지만 셋 다
+// CLAW.c 의 file-scope 전역이고 static 이 아니라 vendor 파일 수정 없이 닿는다.
+extern double TV_BSC[4];      // 적분기.  [0..1] 위치오차(N,E), [2..3] 속도오차(v,u)
+extern double pos_dot_des[3]; // NED 속도 명령.  이것을 회전시킨 것이 uv_des 다
+extern double uv_des[3];      // body 속도 명령 (u,v).  max_vel 5 m/s 로 clamp 된다
+extern double Xtraj[4], dXtraj[4];  // 궤적 생성기 출력/미분 [zz, roll, pitch, yaw]
+extern double alpha[4];       // 백스테핑 가상 제어 = 각속도 명령 [zz, p, q, r]
+extern double Del_Control[4]; // 백스테핑 최종 출력.  scale/clamp 전 [thr,roll,pitch,yaw]
+extern double ps_cmd;         // CLAW 가 해석한 타겟 헤딩 (rad) = wrapToPi(Ship_heading)
+
+// CLAW 가 입력을 받아 넣는 내부 변수.  vendor 파일에서 지역변수를 파일 전역으로
+// 올려 두었다.  TDCN 이 넘긴 값과 짝지어 비교하는 데 쓴다.
+extern double Cur_Lat, Cur_Lon, Cur_Alt;      // Cur_Alt 는 down 양수
+extern double Dest_Lat, Dest_Lon, Dest_Alt;   // Dest_Alt 는 down 양수
 }
 
 // Home_Lat / Home_Lon / Home_Alt / Home_Yaw 와 STV[12] 는 mode_tdcn_CLAW.h
 // 가 이미 extern 선언해 두었으므로 여기서 다시 선언하지 않는다.
 // (CLAW 내부의 home_init 은 file-scope static 이라 외부에서 건드릴 수 없다)
+
+// ---------------------------------------------------------------------------
+// 파라미터
+//
+// 시나리오가 쓰는 고도 / 속도를 소스에서 빼 파라미터로 만든다.  박아 두면 값을
+// 바꿀 때마다 재빌드해야 하고 실기체에서는 현장 조정이 불가능하다.
+//
+// 여기 없는 것 (이미 아두파일럿 파라미터로 조절 가능하다):
+//   state 5/6/7/8 의 수평 이동 속도   WPNAV_SPEED, WPNAV_ACCEL
+//   state 5/6/7 의 수직 속도          WPNAV_SPEED_UP, WPNAV_SPEED_DN, WPNAV_ACCEL_Z
+//   state 9 의 착륙 속도              LAND_SPEED, LAND_SPEED_HIGH, LAND_ALT_LOW
+// ---------------------------------------------------------------------------
+
+const AP_Param::GroupInfo ModeTDCN::var_info[] = {
+
+    // @Param: TKO_ALT
+    // @DisplayName: TDCN takeoff altitude
+    // @Description: Target altitude for state 4 launch, above home
+    // @Units: cm
+    // @Range: 100 5000
+    // @Increment: 10
+    // @User: Standard
+    AP_GROUPINFO("TKO_ALT", 1, ModeTDCN, _takeoff_alt, 1000),
+
+    // @Param: TKO_SPD
+    // @DisplayName: TDCN takeoff climb speed
+    // @Description: Climb speed used during state 4 launch
+    // @Units: cm/s
+    // @Range: 20 500
+    // @Increment: 10
+    // @User: Standard
+    AP_GROUPINFO("TKO_SPD", 2, ModeTDCN, _takeoff_spd, 100),
+
+    // @Param: LND_ALT
+    // @DisplayName: TDCN landing sync altitude
+    // @Description: Altitude held at the end of state 8 landing sync, above home. State 9 starts its descent from here.
+    // @Units: cm
+    // @Range: 100 5000
+    // @Increment: 10
+    // @User: Standard
+    AP_GROUPINFO("LND_ALT", 3, ModeTDCN, _land_alt, 1000),
+
+    // @Param: LND_SPD
+    // @DisplayName: TDCN landing sync descent speed
+    // @Description: Descent speed used during state 8 landing sync. The final touchdown in state 9 uses LAND_SPEED instead.
+    // @Units: cm/s
+    // @Range: 20 500
+    // @Increment: 10
+    // @User: Standard
+    AP_GROUPINFO("LND_SPD", 4, ModeTDCN, _land_spd, 100),
+
+    // @Param: CLAW_ON_OFF
+    // @DisplayName: TDCN use CLAW control output
+    // @Description: 0 leaves ArduPilot flying the vehicle with CLAW running in parallel for monitoring only. 1 replaces the ArduPilot roll pitch yaw and throttle mixer inputs with the CLAW output during state 6 tracking. Only take off with 1 after the CLAW gains have been verified for this airframe.
+    // @Values: 0:ArduPilot flies CLAW monitors,1:CLAW flies
+    // @User: Advanced
+    AP_GROUPINFO("CLAW_ON_OFF", 5, ModeTDCN, _claw_on_off, 0),
+
+    AP_GROUPEND
+};
+
+ModeTDCN::ModeTDCN(void) : Mode()
+{
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+// ---------------------------------------------------------------------------
+// CLAW 게인 파라미터
+//
+// mode_tdcn_CLAW_data_0729.c 의 CLAW_P 초기값을 그대로 기본값으로 옮겼다.
+// 파라미터를 건드리지 않으면 기존과 완전히 같은 값으로 동작한다.
+//
+// BSC_B_mat (제어효과 행렬, 48개) 은 제외했다.  기체 제원에서 나오는 값이라
+// 현장에서 조정할 성질이 아니고, 파라미터로 내기에도 개수가 맞지 않는다.
+// ---------------------------------------------------------------------------
+
+const AP_Param::GroupInfo CLAW_Gains::var_info[] = {
+
+    // @Param: SCALE_TH
+    // @DisplayName: CLAW thrust output scale
+    // @Description: Scales the backstepping thrust output into the normalised command range
+    // @Range: 0.1 10
+    // @User: Advanced
+    AP_GROUPINFO("SCALE_TH", 1, CLAW_Gains, _scale_th, 3.2),
+
+    // @Param: SCALE_R
+    // @DisplayName: CLAW roll output scale
+    // @Description: Scales the backstepping roll output into the normalised command range
+    // @Range: 0.01 2
+    // @User: Advanced
+    AP_GROUPINFO("SCALE_R", 2, CLAW_Gains, _scale_r, 0.25),
+
+    // @Param: SCALE_P
+    // @DisplayName: CLAW pitch output scale
+    // @Description: Scales the backstepping pitch output into the normalised command range
+    // @Range: 0.01 2
+    // @User: Advanced
+    AP_GROUPINFO("SCALE_P", 3, CLAW_Gains, _scale_p, 0.20),
+
+    // @Param: SCALE_Y
+    // @DisplayName: CLAW yaw output scale
+    // @Description: Scales the backstepping yaw output into the normalised command range
+    // @Range: 0.01 2
+    // @User: Advanced
+    AP_GROUPINFO("SCALE_Y", 4, CLAW_Gains, _scale_y, 0.13),
+
+    // @Param: K_POS_P
+    // @DisplayName: CLAW outer loop position P
+    // @Description: Position error to velocity command gain
+    // @Range: 0 2
+    // @User: Advanced
+    AP_GROUPINFO("K_POS_P", 5, CLAW_Gains, _k_pos_p, 0.3),
+
+    // @Param: K_POS_I
+    // @DisplayName: CLAW outer loop position I
+    // @Description: Position error integral gain
+    // @Range: 0 1
+    // @User: Advanced
+    AP_GROUPINFO("K_POS_I", 6, CLAW_Gains, _k_pos_i, 0.01),
+
+    // @Param: K_VEL_P
+    // @DisplayName: CLAW outer loop velocity P
+    // @Description: Velocity error to attitude command gain
+    // @Range: 0 2
+    // @User: Advanced
+    AP_GROUPINFO("K_VEL_P", 7, CLAW_Gains, _k_vel_p, 0.4),
+
+    // @Param: K_VEL_I
+    // @DisplayName: CLAW outer loop velocity I
+    // @Description: Velocity error integral gain
+    // @Range: 0 1
+    // @User: Advanced
+    AP_GROUPINFO("K_VEL_I", 8, CLAW_Gains, _k_vel_i, 0.05),
+
+    // @Param: AWU_LIMIT
+    // @DisplayName: CLAW integrator limit
+    // @Description: Anti windup clamp applied to all four CLAW integrators
+    // @Range: 0.1 10
+    // @User: Advanced
+    AP_GROUPINFO("AWU_LIMIT", 9, CLAW_Gains, _awu_limit, 1.0),
+
+    // @Param: OMEGA_XX
+    // @DisplayName: CLAW trajectory natural frequency North
+    // @Description: Natural frequency of the North axis trajectory filter
+    // @Units: rad/s
+    // @Range: 0.05 20
+    // @User: Advanced
+    AP_GROUPINFO("OMEGA_XX", 10, CLAW_Gains, _ome_xx, 0.3),
+
+    // @Param: OMEGA_YY
+    // @DisplayName: CLAW trajectory natural frequency East
+    // @Description: Natural frequency of the East axis trajectory filter
+    // @Units: rad/s
+    // @Range: 0.05 20
+    // @User: Advanced
+    AP_GROUPINFO("OMEGA_YY", 11, CLAW_Gains, _ome_yy, 0.3),
+
+    // @Param: OMEGA_ZZ
+    // @DisplayName: CLAW trajectory natural frequency height
+    // @Description: Natural frequency of the height trajectory filter
+    // @Units: rad/s
+    // @Range: 0.05 20
+    // @User: Advanced
+    AP_GROUPINFO("OMEGA_ZZ", 12, CLAW_Gains, _ome_zz, 2.0),
+
+    // @Param: OMEGA_PH
+    // @DisplayName: CLAW trajectory natural frequency roll
+    // @Description: Natural frequency of the roll trajectory filter
+    // @Units: rad/s
+    // @Range: 0.05 30
+    // @User: Advanced
+    AP_GROUPINFO("OMEGA_PH", 13, CLAW_Gains, _ome_ph, 9.3),
+
+    // @Param: OMEGA_TH
+    // @DisplayName: CLAW trajectory natural frequency pitch
+    // @Description: Natural frequency of the pitch trajectory filter
+    // @Units: rad/s
+    // @Range: 0.05 30
+    // @User: Advanced
+    AP_GROUPINFO("OMEGA_TH", 14, CLAW_Gains, _ome_th, 12.0),
+
+    // @Param: OMEGA_PS
+    // @DisplayName: CLAW trajectory natural frequency yaw
+    // @Description: Natural frequency of the yaw trajectory filter
+    // @Units: rad/s
+    // @Range: 0.05 30
+    // @User: Advanced
+    AP_GROUPINFO("OMEGA_PS", 15, CLAW_Gains, _ome_ps, 3.0),
+
+    // @Param: ZETA_XX
+    // @DisplayName: CLAW trajectory damping North
+    // @Description: Damping ratio of the North axis trajectory filter
+    // @Range: 0.1 2
+    // @User: Advanced
+    AP_GROUPINFO("ZETA_XX", 16, CLAW_Gains, _zeta_xx, 1.015),
+
+    // @Param: ZETA_YY
+    // @DisplayName: CLAW trajectory damping East
+    // @Description: Damping ratio of the East axis trajectory filter
+    // @Range: 0.1 2
+    // @User: Advanced
+    AP_GROUPINFO("ZETA_YY", 17, CLAW_Gains, _zeta_yy, 1.015),
+
+    // @Param: ZETA_ZZ
+    // @DisplayName: CLAW trajectory damping height
+    // @Description: Damping ratio of the height trajectory filter
+    // @Range: 0.1 2
+    // @User: Advanced
+    AP_GROUPINFO("ZETA_ZZ", 18, CLAW_Gains, _zeta_zz, 0.75),
+
+    // @Param: ZETA_PH
+    // @DisplayName: CLAW trajectory damping roll
+    // @Description: Damping ratio of the roll trajectory filter
+    // @Range: 0.1 2
+    // @User: Advanced
+    AP_GROUPINFO("ZETA_PH", 19, CLAW_Gains, _zeta_ph, 0.98),
+
+    // @Param: ZETA_TH
+    // @DisplayName: CLAW trajectory damping pitch
+    // @Description: Damping ratio of the pitch trajectory filter
+    // @Range: 0.1 2
+    // @User: Advanced
+    AP_GROUPINFO("ZETA_TH", 20, CLAW_Gains, _zeta_th, 0.98),
+
+    // @Param: ZETA_PS
+    // @DisplayName: CLAW trajectory damping yaw
+    // @Description: Damping ratio of the yaw trajectory filter
+    // @Range: 0.1 2
+    // @User: Advanced
+    AP_GROUPINFO("ZETA_PS", 21, CLAW_Gains, _zeta_ps, 0.9),
+
+    // @Param: TAU_HDOT
+    // @DisplayName: CLAW climb rate time constant
+    // @Description: Time constant of the climb rate channel
+    // @Units: s
+    // @Range: 0.01 2
+    // @User: Advanced
+    AP_GROUPINFO("TAU_HDOT", 22, CLAW_Gains, _tau_hdot, 0.164297),
+
+    // @Param: TAU_R
+    // @DisplayName: CLAW yaw rate time constant
+    // @Description: Time constant of the yaw rate channel
+    // @Units: s
+    // @Range: 0.01 2
+    // @User: Advanced
+    AP_GROUPINFO("TAU_R", 23, CLAW_Gains, _tau_r, 0.150985),
+
+    AP_GROUPEND
+};
+
+CLAW_Gains::CLAW_Gains(void)
+{
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+void CLAW_Gains::apply(void) const
+{
+    CLAW_P.BSC_Scale_Thrust = _scale_th;
+    CLAW_P.BSC_Scale_Roll   = _scale_r;
+    CLAW_P.BSC_Scale_Pitch  = _scale_p;
+    CLAW_P.BSC_Scale_Yaw    = _scale_y;
+
+    CLAW_P.BSC_K_POS_P = _k_pos_p;
+    CLAW_P.BSC_K_POS_I = _k_pos_i;
+    CLAW_P.BSC_K_VEL_P = _k_vel_p;
+    CLAW_P.BSC_K_VEL_I = _k_vel_i;
+    CLAW_P.BSC_Int_Limit = _awu_limit;
+
+    CLAW_P.BSC_Ome_XX = _ome_xx;
+    CLAW_P.BSC_Ome_YY = _ome_yy;
+    CLAW_P.BSC_Ome_ZZ = _ome_zz;
+    CLAW_P.BSC_Ome_PH = _ome_ph;
+    CLAW_P.BSC_Ome_TH = _ome_th;
+    CLAW_P.BSC_Ome_PS = _ome_ps;
+
+    CLAW_P.BSC_Zeta_XX = _zeta_xx;
+    CLAW_P.BSC_Zeta_YY = _zeta_yy;
+    CLAW_P.BSC_Zeta_ZZ = _zeta_zz;
+    CLAW_P.BSC_Zeta_PH = _zeta_ph;
+    CLAW_P.BSC_Zeta_TH = _zeta_th;
+    CLAW_P.BSC_Zeta_PS = _zeta_ps;
+
+    CLAW_P.BSC_Tau_hdot = _tau_hdot;
+    CLAW_P.BSC_Tau_r    = _tau_r;
+
+    // BSC_B_mat 은 건드리지 않는다 - data_0729.c 의 값을 그대로 쓴다.
+}
 
 // ---------------------------------------------------------------------------
 // 모드 진입
@@ -98,6 +400,20 @@ bool ModeTDCN::init(bool ignore_checks)
     _was_armed = motors->armed();
     _air_hold_valid = false;
 
+    // 무장 시각.  이미 무장된 채로 모드에 들어왔더라도 "방금 무장한 것" 으로
+    // 보수적으로 잡는다.  지상이면 state 4 가 정착 대기를 한 번 거치게 되고,
+    // 공중이면 어차피 대기 조건(is_disarmed_or_landed)에 안 걸린다.
+    _armed_ms = AP_HAL::millis();
+    _armed_prev = motors->armed();
+    _takeoff_started = false;
+
+    _in_cur_lat = _in_cur_lng = _in_cur_alt = 0.0;
+    _in_dst_lat = _in_dst_lng = _in_dst_alt = 0.0;
+    _in_vel_n = _in_vel_e = _in_vel_d = 0.0;
+    _in_p = _in_q = _in_r = 0.0f;
+    _in_roll = _in_pitch = _in_yaw = 0.0f;
+    _in_ship_hdg = 0.0f;
+
     // CLAW 상시 실행 - 모니터링을 위해 모드에 있는 동안은 계속 돌린다
     Arming = 1;
 
@@ -122,6 +438,17 @@ void ModeTDCN::exit()
 void ModeTDCN::run()
 {
     // (완료) 1단계 - GCS command 파싱
+
+    // 무장 엣지 추적.  state 4 가 "무장한 지 얼마나 됐는가" 를 봐야 하는데,
+    // 무장은 state 3 / state 4 / 자동 해제 후 재무장 등 여러 경로로 걸리므로
+    // 한 곳에서 모아 잡는다.
+    {
+        const bool armed_now = motors->armed();
+        if (armed_now && !_armed_prev) {
+            _armed_ms = AP_HAL::millis();
+        }
+        _armed_prev = armed_now;
+    }
 
     // 2단계 - State 처리
     switch (_state) {
@@ -390,15 +717,39 @@ void ModeTDCN::Update_Info_for_CLAW()
 }
 
 // ---------------------------------------------------------------------------
-// CLAW 출력 모니터링
+// TDCN <-> CLAW 인터페이스 검증 로그
 //
-// v1 은 CLAW 출력을 기체에 적용하지 않으므로, 값이 맞는지는 로그로만 확인한다.
-// 400Hz 를 그대로 남기면 과하므로 8회마다 1회 (50Hz) 기록한다.
+// 통합에서 가장 먼저 확정해야 할 것은 "TDCN 이 넘긴 값을 CLAW 가 같은 값으로
+// 인식하는가" 다.  그래서 Update_Info_for_CLAW() 가 채운 값과, CLAW_step() 이
+// 그것을 받아 내부 변수에 넣은 값을 짝지어 남긴다.
 //
-//   CLAW_Y.cur_poti  CLAW 가 계산한 home 기준 상대 위치 (m)
-//                    = (STV[9], STV[10], -STV[11]) = (North, East, Up)
-//   Err_N / E / D    CLAW 내부 위치 오차 (m).  N/E 는 leash 25m 로 clamp 된다
-//   CLAW_Y.v_cmd     CLAW 제어 출력 (-1 ~ +1 정규화)
+//   TDCP  현재 위치   Cur_Pos       <-> Cur_Lat  / Cur_Lon  / Cur_Alt
+//   TDCT  타겟        Dest_poti_i   <-> Dest_Lat / Dest_Lon / Dest_Alt
+//                     Ship_heading  <-> ps_cmd
+//   TDCI  자세/각속도 p,q,r,Roll,Pitch,DR_heading <-> STV[3..8]
+//   TDCV  속도        XTV[0..2] (넘긴 값)         <-> XTV[0..2] (CLAW 가 본 값)
+//
+// [시퀀스] 같은 스텝끼리 비교해야 의미가 있다.  그래서
+//   Update_Info_for_CLAW() -> [넘긴 값 스냅샷] -> CLAW_step() -> [CLAW 내부값 읽기]
+// 순으로 고정했다.  로그 데시메이션(8회당 1회)도 이 경로 안에서 걸리므로 두
+// 쪽이 한 스텝 어긋날 일이 없다.
+//
+// [고도] CLAW 는 안에서 down 양수로 뒤집는다 (Cur_Alt = -Cur_Pos.z).  그래서
+// 넘긴 쪽도 down 으로 뒤집어 남긴다.  양쪽 모두 down 양수다.
+//
+// [바뀌는 것] 아래는 CLAW 가 의도적으로 바꾸는 부분이라 차이가 나는 게 정상이다.
+//   Dest_*   home 을 래치하는 그 한 스텝만 현재 위치로 덮어쓴다 (CLAW.c L187-189)
+//   STV[8]   wrapToPi(DR_heading)
+//   ps_cmd   wrapToPi(Ship_heading)
+// 나머지는 대입만 하므로 모든 스텝에서 정확히 같아야 한다.
+//
+// ---------------------------------------------------------------------------
+// 제어 비교 로그 (인터페이스가 확정된 뒤에 본다)
+//
+//   TDCA  목표자세   Xtraj[1..3]  <-> 아두파일럿 attitude target
+//   TDCR  각속도     alpha[1..3]  <-> 아두파일럿 rate target
+//   TDCC  제어출력   v_cmd        <-> motors 출력 (+ clamp 전 값)
+//   TDCE  CLAW 내부  오차 / 적분기 / 속도명령 / 궤적
 // ---------------------------------------------------------------------------
 
 void ModeTDCN::Log_Write_TDCN()
@@ -408,35 +759,258 @@ void ModeTDCN::Log_Write_TDCN()
         return;
     }
 
-// @LoggerMessage: TDCN
-// @Description: TDCN mode CLAW controller monitor
+    const uint64_t now_us = AP_HAL::micros64();
+
+// @LoggerMessage: TDCP
+// @Description: TDCN current position handed to CLAW vs read inside CLAW
 // @Field: TimeUS: Time since system startup
 // @Field: St: TDCN scenario state, 1 to 11
-// @Field: PN: CLAW computed position North, relative to CLAW home
-// @Field: PE: CLAW computed position East, relative to CLAW home
-// @Field: PU: CLAW computed position Up, relative to CLAW home
-// @Field: EN: CLAW position error North
-// @Field: EE: CLAW position error East
-// @Field: ED: CLAW position error Down
-// @Field: CR: CLAW roll command, normalised
-// @Field: CP: CLAW pitch command, normalised
-// @Field: CY: CLAW yaw command, normalised
-// @Field: CH: CLAW height command, normalised
-    AP::logger().WriteStreaming("TDCN",
-                                "TimeUS,St,PN,PE,PU,EN,EE,ED,CR,CP,CY,CH",
-                                "QBffffffffff",
-                                AP_HAL::micros64(),
+// @Field: TLat: Current latitude handed to CLAW
+// @Field: TLng: Current longitude handed to CLAW
+// @Field: TDwn: Current altitude handed to CLAW, down positive
+// @Field: CLat: Current latitude inside CLAW
+// @Field: CLng: Current longitude inside CLAW
+// @Field: CDwn: Current altitude inside CLAW, down positive
+    AP::logger().WriteStreaming("TDCP",
+                                "TimeUS,St,TLat,TLng,TDwn,CLat,CLng,CDwn",
+                                "QBddfddf",
+                                now_us,
                                 (uint8_t)_state,
-                                (double)CLAW_Y.cur_poti.x,
-                                (double)CLAW_Y.cur_poti.y,
-                                (double)CLAW_Y.cur_poti.z,
-                                (double)Err_N,
-                                (double)Err_E,
-                                (double)Err_D,
+                                _in_cur_lat,
+                                _in_cur_lng,
+                                (double)(-_in_cur_alt),     // up -> down
+                                Cur_Lat,
+                                Cur_Lon,
+                                (double)Cur_Alt);
+
+// @LoggerMessage: TDCT
+// @Description: TDCN target handed to CLAW vs read inside CLAW
+// @Field: TimeUS: Time since system startup
+// @Field: TLat: Target latitude handed to CLAW
+// @Field: TLng: Target longitude handed to CLAW
+// @Field: TDwn: Target altitude handed to CLAW, down positive
+// @Field: THdg: Target heading handed to CLAW
+// @Field: CLat: Target latitude inside CLAW
+// @Field: CLng: Target longitude inside CLAW
+// @Field: CDwn: Target altitude inside CLAW, down positive
+// @Field: CHdg: Target heading inside CLAW, after wrapToPi
+    AP::logger().WriteStreaming("TDCT",
+                                "TimeUS,TLat,TLng,TDwn,THdg,CLat,CLng,CDwn,CHdg",
+                                "Qddffddff",
+                                now_us,
+                                _in_dst_lat,
+                                _in_dst_lng,
+                                (double)(-_in_dst_alt),     // up -> down
+                                (double)degrees(_in_ship_hdg),
+                                Dest_Lat,
+                                Dest_Lon,
+                                (double)Dest_Alt,
+                                (double)degrees(ps_cmd));
+
+// @LoggerMessage: TDCI
+// @Description: TDCN IMU values handed to CLAW vs read inside CLAW
+// @Field: TimeUS: Time since system startup
+// @Field: Tp: Roll rate handed to CLAW
+// @Field: Tq: Pitch rate handed to CLAW
+// @Field: Tr: Yaw rate handed to CLAW
+// @Field: TRol: Roll angle handed to CLAW
+// @Field: TPit: Pitch angle handed to CLAW
+// @Field: TYaw: Yaw angle handed to CLAW
+// @Field: Cp: Roll rate inside CLAW, STV3
+// @Field: Cq: Pitch rate inside CLAW, STV4
+// @Field: Cr: Yaw rate inside CLAW, STV5
+// @Field: CRol: Roll angle inside CLAW, STV6
+// @Field: CPit: Pitch angle inside CLAW, STV7
+// @Field: CYaw: Yaw angle inside CLAW, STV8 after wrapToPi
+    AP::logger().WriteStreaming("TDCI",
+                                "TimeUS,Tp,Tq,Tr,TRol,TPit,TYaw,Cp,Cq,Cr,CRol,CPit,CYaw",
+                                "Qffffffffffff",
+                                now_us,
+                                (double)_in_p,
+                                (double)_in_q,
+                                (double)_in_r,
+                                (double)_in_roll,
+                                (double)_in_pitch,
+                                (double)_in_yaw,
+                                (double)STV[3],
+                                (double)STV[4],
+                                (double)STV[5],
+                                (double)STV[6],
+                                (double)STV[7],
+                                (double)STV[8]);
+
+// @LoggerMessage: TDCV
+// @Description: TDCN velocity handed to CLAW vs read inside CLAW, NED
+// @Field: TimeUS: Time since system startup
+// @Field: TVN: North velocity handed to CLAW
+// @Field: TVE: East velocity handed to CLAW
+// @Field: TVD: Down velocity handed to CLAW
+// @Field: CVN: North velocity inside CLAW, XTV0
+// @Field: CVE: East velocity inside CLAW, XTV1
+// @Field: CVD: Down velocity inside CLAW, XTV2
+    AP::logger().WriteStreaming("TDCV",
+                                "TimeUS,TVN,TVE,TVD,CVN,CVE,CVD",
+                                "Qffffff",
+                                now_us,
+                                (double)_in_vel_n,
+                                (double)_in_vel_e,
+                                (double)_in_vel_d,
+                                (double)XTV[0],
+                                (double)XTV[1],
+                                (double)XTV[2]);
+
+    // --- NED 위치 비교 (TDCL) ---
+    //
+    // 아두파일럿은 EKF 가 낸 NED 를 그대로 쓰고, CLAW 는 위경도를 받아 자기
+    // 식(Lat2m/Lon2m)으로 NED 를 다시 만든다.  그 변환식 차이를 보는 것이 목적이다.
+    //
+    // [원점] 서로 다르다.  아두파일럿은 EKF origin, CLAW 는 state 6 진입 위치다.
+    // 제자리 이륙 후 넘어오므로 수평은 거의 같고 고도만 진입 고도만큼 차이난다.
+    // 원점을 억지로 맞추지 않고 각자 값을 그대로 남긴다 - 맞추려면 환산식이
+    // 하나 더 끼어들어 정작 보려는 변환식 차이가 가려진다.
+    //
+    // [부호] 양쪽 다 down 양수다.  CLAW 의 STV[11] 은 Cur_Alt - Home_Alt 로
+    // 이미 down 양수이고, 아두파일럿은 NEU 의 z 를 뒤집어 맞춘다.
+    const Vector3f &pos_neu_cm = inertial_nav.get_position_neu_cm();
+
+// @LoggerMessage: TDCL
+// @Description: TDCN NED position, ArduPilot EKF vs CLAW lat lon conversion
+// @Field: TimeUS: Time since system startup
+// @Field: AN: ArduPilot North, from EKF origin
+// @Field: AE: ArduPilot East, from EKF origin
+// @Field: AD: ArduPilot Down, from EKF origin
+// @Field: CN: CLAW North, STV9, from CLAW home
+// @Field: CE: CLAW East, STV10, from CLAW home
+// @Field: CD: CLAW Down, STV11, from CLAW home
+    AP::logger().WriteStreaming("TDCL",
+                                "TimeUS,AN,AE,AD,CN,CE,CD",
+                                "Qffffff",
+                                now_us,
+                                (double)(pos_neu_cm.x * 0.01f),
+                                (double)(pos_neu_cm.y * 0.01f),
+                                (double)(-pos_neu_cm.z * 0.01f),   // up -> down
+                                (double)STV[9],
+                                (double)STV[10],
+                                (double)STV[11]);
+
+// @LoggerMessage: TDCA
+// @Description: TDCN attitude target, CLAW vs ArduPilot
+// @Field: TimeUS: Time since system startup
+// @Field: XR: CLAW trajectory generator roll target
+// @Field: XP: CLAW trajectory generator pitch target
+// @Field: XY: CLAW trajectory generator yaw target
+// @Field: DR: ArduPilot attitude controller roll target
+// @Field: DP: ArduPilot attitude controller pitch target
+// @Field: DY: ArduPilot attitude controller yaw target
+    AP::logger().WriteStreaming("TDCA",
+                                "TimeUS,XR,XP,XY,DR,DP,DY",
+                                "Qffffff",
+                                now_us,
+                                (double)Xtraj[1],
+                                (double)Xtraj[2],
+                                (double)Xtraj[3],
+                                (double)attitude_control->get_att_target_euler_rad().x,
+                                (double)attitude_control->get_att_target_euler_rad().y,
+                                (double)attitude_control->get_att_target_euler_rad().z);
+
+// @LoggerMessage: TDCR
+// @Description: TDCN angular rate command, CLAW vs ArduPilot
+// @Field: TimeUS: Time since system startup
+// @Field: CRR: CLAW roll rate command
+// @Field: CRP: CLAW pitch rate command
+// @Field: CRY: CLAW yaw rate command
+// @Field: ARR: ArduPilot roll rate target
+// @Field: ARP: ArduPilot pitch rate target
+// @Field: ARY: ArduPilot yaw rate target
+    AP::logger().WriteStreaming("TDCR",
+                                "TimeUS,CRR,CRP,CRY,ARR,ARP,ARY",
+                                "Qffffff",
+                                now_us,
+                                (double)alpha[1],
+                                (double)alpha[2],
+                                (double)alpha[3],
+                                (double)attitude_control->get_rate_ef_targets().x,
+                                (double)attitude_control->get_rate_ef_targets().y,
+                                (double)attitude_control->get_rate_ef_targets().z);
+
+// @LoggerMessage: TDCC
+// @Description: TDCN control output, CLAW vs ArduPilot, normalised
+// @Field: TimeUS: Time since system startup
+// @Field: CR: CLAW roll command
+// @Field: CP: CLAW pitch command
+// @Field: CY: CLAW yaw command
+// @Field: CH: CLAW height command
+// @Field: MR: ArduPilot roll input to mixer, rate PID plus feedforward
+// @Field: MP: ArduPilot pitch input to mixer, rate PID plus feedforward
+// @Field: MY: ArduPilot yaw input to mixer, rate PID plus feedforward
+// @Field: MT: ArduPilot throttle input to mixer, 0 to 1
+// @Field: UR: CLAW roll command before clamp
+// @Field: UP: CLAW pitch command before clamp
+// @Field: UY: CLAW yaw command before clamp
+// @Field: UH: CLAW height command before clamp
+// @Field: ACT: 1 when the CLAW output is actually driving the mixer
+    AP::logger().WriteStreaming("TDCC",
+                                "TimeUS,CR,CP,CY,CH,MR,MP,MY,MT,UR,UP,UY,UH,ACT",
+                                "QffffffffffffB",
+                                now_us,
                                 (double)CLAW_Y.v_cmd.cmd_roll,
                                 (double)CLAW_Y.v_cmd.cmd_pitch,
                                 (double)CLAW_Y.v_cmd.cmd_yaw,
-                                (double)CLAW_Y.v_cmd.cmd_height);
+                                (double)CLAW_Y.v_cmd.cmd_height,
+                                // 믹서가 실제로 소비하는 값과 같게 맞춘다.
+                                // AP_MotorsMatrix::output_armed_stabilizing() 은
+                                //   roll_thrust = (_roll_in + _roll_in_ff) * gain
+                                // 처럼 rate PID 출력에 피드포워드를 더해 쓴다.
+                                // get_roll() 은 _roll_in 만이라 그것만 비교하면
+                                // 아두파일럿 몫을 과소평가한다.  스로틀은
+                                // 피드포워드가 없어 get_throttle() 그대로다.
+                                (double)(motors->get_roll()  + motors->get_roll_ff()),
+                                (double)(motors->get_pitch() + motors->get_pitch_ff()),
+                                (double)(motors->get_yaw()   + motors->get_yaw_ff()),
+                                (double)motors->get_throttle(),
+                                // CLAW.c 의 스케일 순서를 그대로 재현한다.
+                                // clamp 만 빼면 CR..CH 와 같아야 하므로,
+                                // 벌어지는 구간이 곧 포화 구간이다.
+                                (double)(Del_Control[1] * CLAW_P.BSC_Scale_Roll),
+                                (double)(Del_Control[2] * CLAW_P.BSC_Scale_Pitch * -1.0),
+                                (double)(Del_Control[3] * CLAW_P.BSC_Scale_Yaw),
+                                (double)(Del_Control[0] * CLAW_P.BSC_Scale_Thrust),
+                                // CLAW 출력이 실제로 믹서를 몰고 있는가.
+                                // TDCN_CLAW_ON_OFF 를 켰어도 state / home_init /
+                                // 비행 여부 조건이 안 맞으면 0 이다.
+                                (uint8_t)(claw_output_active() ? 1 : 0));
+
+// @LoggerMessage: TDCE
+// @Description: TDCN CLAW controller internal state
+// @Field: TimeUS: Time since system startup
+// @Field: EN: CLAW position error North, leash clamped
+// @Field: EE: CLAW position error East, leash clamped
+// @Field: ED: CLAW position error Down
+// @Field: I0: CLAW position error integrator North
+// @Field: I1: CLAW position error integrator East
+// @Field: I2: CLAW velocity error integrator lateral
+// @Field: I3: CLAW velocity error integrator forward
+// @Field: DN: CLAW velocity command North, before body rotation
+// @Field: DE: CLAW velocity command East, before body rotation
+// @Field: UU: CLAW desired body forward velocity
+// @Field: UV: CLAW desired body lateral velocity
+// @Field: XZ: CLAW trajectory generator height target
+    AP::logger().WriteStreaming("TDCE",
+                                "TimeUS,EN,EE,ED,I0,I1,I2,I3,DN,DE,UU,UV,XZ",
+                                "Qffffffffffff",
+                                now_us,
+                                (double)Err_N,
+                                (double)Err_E,
+                                (double)Err_D,
+                                (double)TV_BSC[0],
+                                (double)TV_BSC[1],
+                                (double)TV_BSC[2],
+                                (double)TV_BSC[3],
+                                (double)pos_dot_des[0],
+                                (double)pos_dot_des[1],
+                                (double)uv_des[0],
+                                (double)uv_des[1],
+                                (double)Xtraj[0]);
 #endif  // HAL_LOGGING_ENABLED
 }
 
@@ -453,11 +1027,152 @@ void ModeTDCN::Log_Write_TDCN()
 // v1 은 CLAW 출력을 기체에 적용하지 않고 로그로만 확인한다.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// CLAW 출력을 믹서에 넣어도 되는 상태인가
+//
+// 아래를 모두 만족해야 한다.  하나라도 어긋나면 아두파일럿이 계속 몬다.
+//
+//   TDCN_CLAW_ON_OFF == 1   조작자가 명시적으로 켰는가
+//   state 6                 CLAW 가 도는 유일한 state.  다른 state 에서는
+//                           CLAW_Y 가 갱신되지 않아 낡은 값이 나간다
+//   home_init               CLAW 가 home 을 잡기 전에는 STV[9..11] 이 0 이라
+//                           오차가 통째로 틀리다
+//   비행 중                 지상에서 넣으면 make_safe_ground_handling() 과
+//                           싸우게 된다
+// ---------------------------------------------------------------------------
+
+bool ModeTDCN::claw_output_active() const
+{
+    return _claw_on_off == 1
+           && _state == State::TRACKING
+           && home_init
+           && motors->armed()
+           && !is_disarmed_or_landed();
+}
+
+// ---------------------------------------------------------------------------
+// 믹서 직전 훅
+//
+// Copter 의 fast loop 는 run_rate_controller() 로 제어값을 만들어 motors 에
+// 넣어두고, 그 뒤 motors_output() 이 그 값으로 모터를 돌린다.  이 함수는
+// motors_output() 이 flightmode->output_to_motors() 로 부르는 자리이므로,
+// [계산은 끝났고 아직 모터로 안 나간] 시점이다.  여기서 갈아끼운다.
+//
+// run_rate_controller() 자체를 건너뛰지 않는 이유:
+//   - 각속도 PID 의 적분항과 필터가 계속 갱신되어, CLAW 를 껐을 때 (또는
+//     조건이 깨져 아두파일럿으로 돌아올 때) 튀지 않는다
+//   - attitude_control 의 목표 자세도 살아 있어 다른 state 로 넘어갈 때
+//     인수인계가 매끄럽다
+//
+// [피드포워드] motors 믹서는 (_roll_in + _roll_in_ff) 를 쓴다.  CLAW 값만
+// 넣고 ff 를 두면 아두파일럿 몫이 섞이므로 ff 는 0 으로 지운다.
+//
+// [스로틀] 범위와 기준점이 둘 다 다르다.
+//
+//   CLAW   cmd_height  -1 ~ +1,  0 이 호버
+//   믹서   throttle     0 ~  1,  호버는 기체마다 다르다 (MOT_THST_HOVER)
+//
+// CLAW 의 0 이 호버라는 것은 로그로 확인했다.  아두파일럿이 고도를 잡고 있던
+// 7101 샘플에서 cmd_height 평균이 +0.0009 (표준편차 0.018) 였고, 같은 구간
+// 실제 스로틀은 0.332 였다.  즉 "고도 오차가 없을 때 0 을 낸다" 는 뜻이므로
+// cmd_height 는 절대 스로틀이 아니라 [호버 기준 증분] 이다.
+//
+// 그래서 0 을 그 기체의 실제 호버값에 맞춘다.  중앙에서 위아래 여유가 다르므로
+// 꺾인 직선이 된다 (아두파일럿이 조종기 스로틀 스틱을 처리하는 방식과 같다):
+//
+//     cmd_height  -1  ->  0        무추력
+//     cmd_height   0  ->  hover    MOT_THST_HOVER
+//     cmd_height  +1  ->  1        최대
+//
+// 호버값은 get_throttle_hover() 로 읽는다.  아두파일럿이 비행 중 학습해 갱신
+// 하므로 기체가 바뀌어도 자동으로 맞는다.  상수로 박으면 실기체(무거워서 0.5~0.6)
+// 에서 어긋난다.
+//
+// 앞서 쓰던 (x+1)/2 는 0 을 0.5 로 보냈다.  호버가 0.334 인 이 기체에서는
+// 인계 순간 +0.17 (호버 대비 +50%) 짜리 스로틀 계단이 주입돼 튀어올랐고,
+// CLAW 가 그것을 되돌리려다 진동했다.
+// ---------------------------------------------------------------------------
+
+void ModeTDCN::output_to_motors()
+{
+    if (claw_output_active()) {
+        motors->set_roll(constrain_float(CLAW_Y.v_cmd.cmd_roll,  -1.0f, 1.0f));
+        motors->set_pitch(constrain_float(CLAW_Y.v_cmd.cmd_pitch, -1.0f, 1.0f));
+        motors->set_yaw(constrain_float(CLAW_Y.v_cmd.cmd_yaw,   -1.0f, 1.0f));
+
+        const float hover = motors->get_throttle_hover();
+        const float ch    = constrain_float(CLAW_Y.v_cmd.cmd_height, -1.0f, 1.0f);
+        const float thr   = is_negative(ch) ? hover * (1.0f + ch)
+                                            : hover + ch * (1.0f - hover);
+        motors->set_throttle(constrain_float(thr, 0.0f, 1.0f));
+
+        // 아두파일럿 각속도 PID 의 피드포워드가 더해지지 않게 지운다
+        motors->set_roll_ff(0.0f);
+        motors->set_pitch_ff(0.0f);
+        motors->set_yaw_ff(0.0f);
+    }
+
+    Mode::output_to_motors();
+}
+
 void ModeTDCN::Run_CLAW()
 {
+    claw_gains.apply();         // 파라미터 -> CLAW_P (바꾸면 즉시 반영된다)
     Update_Info_for_CLAW();     // CLAW_U 에 기체 정보 + GCS 타겟 전달
+
+    // --- 넘긴 값 스냅샷 ---
+    //
+    // "TDCN 이 넘긴 값" 과 "CLAW 가 내부에서 인식한 값" 을 같은 스텝끼리 비교
+    // 하기 위한 것이다.  CLAW_step() 은 home 래치 스텝에서 Dest_poti_i 를
+    // 스스로 덮어쓰므로, 호출 뒤에 읽으면 넘긴 값이 아니게 된다.
+    _in_cur_lat   = CLAW_U.Cur_Pos.x;
+    _in_cur_lng   = CLAW_U.Cur_Pos.y;
+    _in_cur_alt   = CLAW_U.Cur_Pos.z;           // up 양수 (로그에서 뒤집는다)
+    _in_dst_lat   = CLAW_U.Dest_poti_i.x;
+    _in_dst_lng   = CLAW_U.Dest_poti_i.y;
+    _in_dst_alt   = CLAW_U.Dest_poti_i.z;       // up 양수
+    _in_vel_n     = XTV[0];
+    _in_vel_e     = XTV[1];
+    _in_vel_d     = XTV[2];
+    _in_p         = CLAW_U.p;
+    _in_q         = CLAW_U.q;
+    _in_r         = CLAW_U.r;
+    _in_roll      = CLAW_U.Roll;
+    _in_pitch     = CLAW_U.Pitch;
+    _in_yaw       = CLAW_U.DR_heading_f.DR_heading;
+    _in_ship_hdg  = CLAW_U.Ship_heading;
+
+    // CLAW 가 이번 스텝에 home 을 래치하는지 미리 봐 둔다.  래치 직후에만
+    // 손볼 것이 있어서다 (아래 참조).
+    const bool home_was_init = home_init;
+
     CLAW_step();                // CLAW 실행 (CLAW.c 의 함수 직접 호출)
-    Log_Write_TDCN();           // CLAW 출력(위치 / 제어값) 받아오기
+
+    // --- 래치 직후 요 궤적 초기화 ---
+    //
+    // CLAW 는 home 을 잡는 스텝에서 궤적 생성기를 전부 0 으로 리셋한다
+    // (CLAW.c 의 for 문, Xtraj/dXtraj/ddXtraj/TV_BSC).  고도(Xtraj[0]) 와
+    // 롤/피치(Xtraj[1..2]) 는 0 이 맞다 - 래치 시점의 상대고도가 0 이고,
+    // 호버 중이면 자세도 수평이라 오차가 없다.
+    //
+    // 그런데 Xtraj[3] 은 요 목표이고 0 은 [진북] 을 뜻한다.  기수가 북쪽이
+    // 아닌 채로 state 6 에 들어가면 그 헤딩이 통째로 자세 오차가 된다:
+    //     z1[3] = wrapToPi(STV[8] - Xtraj[3]) = 현재 헤딩
+    // SITL 은 매번 진북(-1도) 으로 진입해 안 드러났지만, 실기체 로그에서는
+    // 진입 헤딩이 121도였다.  그 상태로 CLAW 출력을 물리면 진입 즉시 최대
+    // 요 명령이 나간다 (179도 오차에서 cmd_yaw 가 1.0 으로 포화하는 것을 확인).
+    //
+    // 그래서 래치 직후 요 궤적을 현재 헤딩에서 출발시킨다.  이러면 초기 오차가
+    // 0 이고, 궤적 생성기가 목표 헤딩(ps_cmd) 으로 부드럽게 옮겨 간다.
+    //
+    // CLAW.c 를 고치지 않고 여기서 처리한다.  Xtraj 가 전역으로 노출되어 있어
+    // 가능하고, vendor 파일 수정분을 늘리지 않는 편이 새 버전을 받을 때 낫다.
+    if (!home_was_init && home_init) {
+        Xtraj[3]  = STV[8];     // 요 목표 = 현재 헤딩
+        dXtraj[3] = 0.0;        // 각속도도 0 에서 출발
+    }
+
+    Log_Write_TDCN();           // 스냅샷 + CLAW 내부값을 짝지어 기록
 }
 
 // ---------------------------------------------------------------------------
@@ -569,33 +1284,63 @@ void ModeTDCN::state_armed()            // 3 ARMED
     preflight_vehicle_handling();
 }
 
-static const float _takeoff_alt_cm    = 1000.0f;    // 목표 고도 (cm, home 기준 up)  10 m
-static const float _takeoff_speed_cms =  100.0f;    // 상승 속도 (cm/s)              1 m/s
+
+// 무장 후 이륙을 시작하기까지의 정착 대기 (ms).
+//
+// 무장하자마자 auto_takeoff 를 걸면, 모터가 아직 GROUND_IDLE 로 spool-up 하는
+// 중인데 추력 명령이 올라가 튀어오르듯 이륙한다 (실기체에서 확인).  아두파일럿의
+// spool-up 자체는 MOT_SPOOL_TIME (기본 0.5s) 인데, 그 뒤로 자세제어가 자리를
+// 잡을 시간까지 보고 여유 있게 잡는다.
+//
+// 상한은 DISARM_DELAY (기본 10초) 다.  이보다 오래 기다리면 정착 대기 중에
+// 자동 무장 해제가 걸려 다시 무장 -> 다시 대기가 반복된다.
+static const uint32_t _takeoff_settle_ms = 2000;    // 2 초
+
 void ModeTDCN::state_launch()           // 4 이륙 사출
 {
-    // 무장 상태를 "유지" 한다.
+    const uint32_t now_ms = AP_HAL::millis();
+
+    if (_state_entered) {
+        _takeoff_started = false;
+    }
+
+    // --- 1. 무장 상태를 "유지" 한다 ---
     //
     // state 3 은 지상에서 DISARM_DELAY (기본 10초) 로 자동 무장 해제가 반복되고
     // 그때마다 state_armed() 가 다시 무장한다.  하필 그 무장이 풀린 순간에
     // 4번이 들어오면 이 state 가 무장 없이 시작된다.  auto_takeoff.run() 은
     // 무장이 없으면 아무 것도 못 하고, state 4 에는 회복 수단이 없으므로
     // 이륙도 못 하고 다음 번호로도 못 넘어간 채 영구히 멈춘다.
-    // 그래서 이륙이 끝나기 전에 무장이 풀려 있으면 다시 무장하고, 무장이
-    // 될 때까지 이륙 시작을 미룬다.
-    bool takeoff_start = _state_entered;
+    // 그래서 이륙이 끝나기 전에 무장이 풀려 있으면 다시 무장한다.
     if (!_state_done && !motors->armed()) {
-        const uint32_t now_ms = AP_HAL::millis();
         if (_state_entered || (now_ms - _action_retry_ms) >= 1000) {
             _action_retry_ms = now_ms;
             copter.arming.arm(AP_Arming::Method::MAVLINK);
         }
         if (!motors->armed()) {
+            make_safe_ground_handling();
             return;                 // 아직 무장 못 함.  다음 루프에서 재시도
         }
-        takeoff_start = true;       // 재무장했으니 이륙을 처음부터 다시 시작
+        _takeoff_started = false;   // 재무장했으니 이륙을 처음부터 다시 시작
     }
 
-    if (takeoff_start) {
+    // --- 2. 무장 직후에는 곧바로 이륙하지 않는다 ---
+    //
+    // 무장 시각은 run() 이 엣지로 잡아둔 _armed_ms 다.  state 3 에서 이미
+    // 무장돼 시간이 지났으면 이 조건에 걸리지 않고 바로 이륙하므로, 정상
+    // 시나리오에는 지연이 생기지 않는다.  여기서 걸리는 것은 "방금 무장한"
+    // 경우뿐이다 (state 3 을 건너뛰었거나 자동 해제 후 재무장).
+    //
+    // 대기 중에는 GROUND_IDLE 을 유지한다.  is_disarmed_or_landed() 로 감싸는
+    // 이유는 공중에서 이 state 에 들어온 경우에 지상 처리를 하면 추락하기
+    // 때문이다.
+    if (!_takeoff_started && is_disarmed_or_landed() &&
+        (now_ms - _armed_ms) < _takeoff_settle_ms) {
+        make_safe_ground_handling();
+        return;
+    }
+
+    if (!_takeoff_started) {
         // --- 이륙 시작 (ModeGuided::do_user_takeoff_start() 와 같은 순서) ---
 
         // 이륙 중에는 heading 을 유지한다
@@ -603,18 +1348,18 @@ void ModeTDCN::state_launch()           // 4 이륙 사출
 
         // 상승 속도 제한.  하강 속도도 같은 값으로 둔다 (이륙에는 쓰이지 않지만
         // 컨트롤러 한계를 비대칭으로 두지 않는다).
-        pos_control->set_max_speed_accel_z(-_takeoff_speed_cms, _takeoff_speed_cms,
+        pos_control->set_max_speed_accel_z(-_takeoff_spd, _takeoff_spd,
                                           g.pilot_accel_z);
-        pos_control->set_correction_speed_accel_z(-_takeoff_speed_cms, _takeoff_speed_cms,
+        pos_control->set_correction_speed_accel_z(-_takeoff_spd, _takeoff_spd,
                                                   g.pilot_accel_z);
 
         // 수직 위치 컨트롤러 초기화 (I 항 클리어)
         pos_control->init_z_controller();
 
         // auto_takeoff 는 목표 고도를 EKF origin 기준 cm 로 받는다.
-        // _takeoff_alt_cm 은 home 기준이므로 변환한다.
+        // _takeoff_alt 은 home 기준이므로 변환한다.
         Location target_loc = copter.current_loc;
-        target_loc.set_alt_cm((int32_t)_takeoff_alt_cm, Location::AltFrame::ABOVE_HOME);
+        target_loc.set_alt_cm((int32_t)_takeoff_alt, Location::AltFrame::ABOVE_HOME);
         int32_t alt_above_origin_cm;
         if (!target_loc.get_alt_cm(Location::AltFrame::ABOVE_ORIGIN,
                                    alt_above_origin_cm)) {
@@ -628,6 +1373,11 @@ void ModeTDCN::state_launch()           // 4 이륙 사출
         // update_auto_armed), 이 시나리오에는 스틱이 없으므로 직접 세운다.
         // Copter::start_takeoff() 도 같은 방식이다.
         copter.set_auto_armed(true);
+
+        // 이륙 시퀀스가 시작됐다.  이 뒤로는 정착 대기 조건을 보지 않는다.
+        _takeoff_started = true;
+        gcs().send_text(MAV_SEVERITY_INFO, "%s: takeoff to %.1fm", name(),
+                        (double)(_takeoff_alt * 0.01f));
     }
 
     // 이륙 제어.  complete 가 true 가 된 뒤에도 계속 호출하면 목표 고도와
@@ -810,6 +1560,26 @@ void ModeTDCN::state_tracking()         // 6 추종 비행
 
     attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(),
                                                   auto_yaw.get_heading());
+
+    // --- CLAW 가 모는 동안 아두파일럿 제어기를 현재 상태에 붙여 둔다 ---
+    //
+    // state 7 로 넘어가면 아두파일럿이 기체를 다시 잡는데, 그때 제어기 내부
+    // 상태가 낡아 있으면 인계 순간 자세와 목표가 어긋나 튄다.  CLAW 가 모는
+    // 동안에는 기체가 아두파일럿 명령을 따르지 않으므로 그 어긋남이 계속 커진다.
+    //
+    // 그래서 매 루프 목표를 현재 자세로 되맞추고 적분항을 비운다.  인계 시점에
+    // 이미 목표 = 실제 이므로 state 7 은 "정지점 계산" 만 하면 된다.
+    //
+    // reset_rate 를 false 로 두는 이유는 각속도 제어기를 계속 돌게 두기
+    // 위해서다.  그래야 PID 필터 상태가 살아 있어 되돌아올 때 부드럽다.
+    //
+    // 위 input_thrust_vector_heading() 을 그대로 두는 것은 의도다.  아두파일럿이
+    // "같은 상황에서 무엇을 명령했을지" 가 로그에 남아야 두 제어기를 비교할 수
+    // 있다 (v1 의 목적).  여기서는 그 결과만 기체에 반영되지 않게 덮는다.
+    if (claw_output_active()) {
+        attitude_control->reset_target_and_rate(false);
+        attitude_control->reset_rate_controller_I_terms();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -907,8 +1677,6 @@ void ModeTDCN::state_landing_wait()     // 7 착륙 대기
 // ---------------------------------------------------------------------------
 
 // state 8 착륙 동기 파라미터 - 여기서 직접 수정한다
-static const float _sync_alt_cm       = 1000.0f;    // 목표 고도 (cm, home 기준 up)  10 m
-static const float _sync_speed_dn_cms =  100.0f;    // 하강 속도 (cm/s)              1.0 m/s
 
 void ModeTDCN::state_landing_sync()     // 8 착륙 동기
 {
@@ -923,10 +1691,10 @@ void ModeTDCN::state_landing_sync()     // 8 착륙 동기
                                            wp_nav->get_wp_acceleration());
         pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(),
                                                    wp_nav->get_wp_acceleration());
-        pos_control->set_max_speed_accel_z(-_sync_speed_dn_cms,
+        pos_control->set_max_speed_accel_z(-_land_spd,
                                            wp_nav->get_default_speed_up(),
                                            wp_nav->get_accel_z());
-        pos_control->set_correction_speed_accel_z(-_sync_speed_dn_cms,
+        pos_control->set_correction_speed_accel_z(-_land_spd,
                                                   wp_nav->get_default_speed_up(),
                                                   wp_nav->get_accel_z());
 
@@ -943,17 +1711,17 @@ void ModeTDCN::state_landing_sync()     // 8 착륙 동기
     }
 
     // 목표 고도를 EKF origin 기준 NEU cm 로 바꿔 Z 만 갈아끼운다.
-    // _sync_alt_cm 은 home 기준이므로 현재 위치를 기준점으로 삼아 변환한다.
+    // _land_alt 은 home 기준이므로 현재 위치를 기준점으로 삼아 변환한다.
     // (매 루프 계산하므로 home 이 갱신되어도 따라간다)
     Location sync_loc = copter.current_loc;
-    sync_loc.set_alt_cm((int32_t)_sync_alt_cm, Location::AltFrame::ABOVE_HOME);
+    sync_loc.set_alt_cm((int32_t)_land_alt, Location::AltFrame::ABOVE_HOME);
     Vector3f sync_neu_cm;
     if (sync_loc.get_vector_from_origin_NEU(sync_neu_cm)) {
         _hold_pos_neu_cm.z = sync_neu_cm.z;     // XY 는 건드리지 않는다
     }
 
     // 완료 판정: 착륙 준비 고도에 도달해야 9번으로 넘어갈 수 있다
-    _state_done = fabsf((float)copter.current_loc.alt - _sync_alt_cm) < 50.0f;
+    _state_done = fabsf((float)copter.current_loc.alt - _land_alt) < 50.0f;
 
     // --- 기체 제어 ---
     if (is_disarmed_or_landed()) {
@@ -977,11 +1745,14 @@ void ModeTDCN::state_landing_sync()     // 8 착륙 동기
 //
 // [기반 모드] LAND (GPS 있는 경우)
 //   초기화  ModeLand::init() 과 동일
-//   제어    Mode::land_run_normal_or_precland()
+//   제어    Mode::land_run_horiz_and_vert_control()  (정밀 착륙은 쓰지 않는다)
 //
 // 착륙 로직을 새로 짜지 않고 아두파일럿 공용 함수를 그대로 호출한다.  그래야
-// 착지 감지(land detector), 지면 효과 보정, 정밀 착륙(AC_PRECLAND), 조종자
-// 재위치(land_repo) 같은 검증된 처리가 전부 따라온다.
+// 착지 감지(land detector), 지면 효과 보정, 조종자 재위치(land_repo) 같은
+// 검증된 처리가 전부 따라온다.
+//
+// [정밀 착륙] 쓰지 않는다.  제자리 착륙만 하면 되고, PLND_* 파라미터에 따라
+// 동작이 갈리면 안 되기 때문이다.  아래 land_run_horiz_and_vert_control() 주석 참조.
 //
 // [착륙 속도] 파라미터로 조정한다.  TDCN 안에 변수를 두지 않는다.
 //
@@ -992,7 +1763,7 @@ void ModeTDCN::state_landing_sync()     // 8 착륙 동기
 //   state 8 이 기체를 LAND_ALT_LOW(10 m)에 놓으므로, 기본 설정에서는 state 9
 //   전 구간이 최종 저속 하강(LAND_SPEED)이다.  더 빠르게/느리게 하려면
 //   LAND_SPEED 를 바꾸면 된다.  고고도 구간까지 조절하려면 state 8 의
-//   _sync_alt_cm 을 LAND_ALT_LOW 보다 높게 잡고 LAND_SPEED_HIGH 를 설정한다.
+//   _land_alt 을 LAND_ALT_LOW 보다 높게 잡고 LAND_SPEED_HIGH 를 설정한다.
 //
 // [CLAW] 돌지 않는다.  state 7 에서 이미 끝났다.
 //
@@ -1046,8 +1817,19 @@ void ModeTDCN::state_landing_stow()     // 9 착륙 수납
     motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
 
     // 아두파일럿 착륙 제어 (수평 유지 + 수직 하강).
-    // 정밀 착륙이 켜져 있으면 그쪽으로, 아니면 일반 착륙으로 분기한다.
-    land_run_normal_or_precland();
+    //
+    // land_run_normal_or_precland() 가 아니라 일반 착륙을 직접 부른다.
+    // 그 함수는 PLND_ENABLED 가 켜져 있으면 정밀 착륙으로 분기하는데,
+    // TDCN 은 제자리 착륙만 하면 되므로 파라미터에 따라 동작이 갈리면 안 된다.
+    //
+    // 실제로 PLND_ENABLED=1, PLND_TYPE=3(SITL_Gazebo) 인 기체에서 타겟을 못 찾아
+    // "PrecLand: Failsafe Measures" 가 뜨고 명령대로 내려오지 않는 것을 확인했다.
+    // (정밀 착륙 상태기계가 재시도 4회 후 failsafe 로 빠져 제자리 정지 -> 수직
+    //  하강으로 자기 판단하에 동작한다)
+    //
+    // 선박 상대 착륙은 CLAW 가 담당할 부분이라, 아두파일럿 정밀 착륙을 함께
+    // 쓰면 선박 추종 제어기가 둘이 된다.  그것도 여기서 쓰지 않는 이유다.
+    land_run_horiz_and_vert_control();
 }
 
 // ---------------------------------------------------------------------------

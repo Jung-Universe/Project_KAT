@@ -621,6 +621,13 @@ public:
     void *mode_zigzag_ptr;
 #endif
 
+#if MODE_TDCN_ENABLED
+    // we need a pointer to the mode for the G2 table
+    void *mode_tdcn_ptr;
+    // CLAW gains live in their own group so the names fit in 16 chars
+    void *claw_gains_ptr;
+#endif
+
     // command model parameters
 #if MODE_ACRO_ENABLED || MODE_SPORT_ENABLED
     AC_CommandModel command_model_acro_rp;

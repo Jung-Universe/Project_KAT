@@ -146,13 +146,20 @@ double Home_Lat = 0.0, Home_Lon = 0.0, Home_Alt = 0.0, Home_Yaw = 0.0;
 bool home_init = false;   /* Sejong: static 제거 - TDCN 모드 재진입 시 외부에서 false 로 리셋해 재홈시킨다 */
 double Err_N, Err_E, Err_D;
 
+/* Sejong: 지역변수 -> 파일 전역.
+   TDCN 이 넘긴 값을 CLAW 가 내부에서 같은 값으로 인식하는지 확인하려면 이
+   변수들을 밖에서 읽어야 한다.  값과 계산은 그대로이고 저장 위치만 바꿨다.
+   원본: CLAW_step() 안의 지역변수였다. */
+double Cur_Lat = 0.0, Cur_Lon = 0.0, Cur_Alt = 0.0;
+double Dest_Lat = 0.0, Dest_Lon = 0.0, Dest_Alt = 0.0;
+
 /* Model step function */
 void CLAW_step(void)
 {
-    // Current Position (Latitude, Longitude, Altitude) 
-    double Cur_Lat = (double)CLAW_U.Cur_Pos.x;
-    double Cur_Lon = (double)CLAW_U.Cur_Pos.y;
-    double Cur_Alt = -(double)CLAW_U.Cur_Pos.z;
+    // Current Position (Latitude, Longitude, Altitude)
+    Cur_Lat = (double)CLAW_U.Cur_Pos.x;
+    Cur_Lon = (double)CLAW_U.Cur_Pos.y;
+    Cur_Alt = -(double)CLAW_U.Cur_Pos.z;
 
     if (Arming == 0) {
         CLAW_Y.v_cmd.cmd_height = 0.0f;
@@ -217,9 +224,10 @@ void CLAW_step(void)
     }
 
     // Target Position (Latitude, Longiutude, Altitude)
-    double Dest_Lat = (double)CLAW_U.Dest_poti_i.x;
-    double Dest_Lon = (double)CLAW_U.Dest_poti_i.y;
-    double Dest_Alt = -(double)CLAW_U.Dest_poti_i.z;
+    /* Sejong: 위 Cur_* 와 같은 이유로 파일 전역으로 옮겼다 (선언은 위쪽). */
+    Dest_Lat = (double)CLAW_U.Dest_poti_i.x;
+    Dest_Lon = (double)CLAW_U.Dest_poti_i.y;
+    Dest_Alt = -(double)CLAW_U.Dest_poti_i.z;
 
     if (home_init) {
         /* Sejong: Lon2m() 인자 수정.  Lon2m 은 "그 위도에서 경도 1도가 몇 m 인가"
@@ -399,9 +407,26 @@ void CLAW_step(void)
     pos_dot_des[1] = pos_des_dot_trim[1] + CLAW_P.BSC_K_POS_P * Err_E + CLAW_P.BSC_K_POS_I * TV_BSC[1];
     pos_dot_des[2] = 0.0;
     
-    uv_des[0] = CTML_inv[0][0] * pos_dot_des[0] + CTML_inv[0][1] * pos_dot_des[1] + CTML_inv[0][2] * pos_dot_des[2];
-    uv_des[1] = CTML_inv[1][0] * pos_dot_des[0] + CTML_inv[1][1] * pos_dot_des[1] + CTML_inv[1][2] * pos_dot_des[2];
-    uv_des[2] = CTML_inv[2][0] * pos_dot_des[0] + CTML_inv[2][1] * pos_dot_des[1] + CTML_inv[2][2] * pos_dot_des[2];
+    /* Sejong: CTML_inv -> CTML 로 수정.
+       pos_dot_des 는 Err_N / Err_E 로 만든 [관성계 NED] 속도 명령이고, uv_des 는
+       아래 412~420 줄에서 STV[0] / STV[1] (body 속도) 와 빼므로 [body] 여야 한다.
+       NED -> body 변환은 CTML 이다 (286 줄에서 STV[0..2] = CTML * XTV[0..2] 로
+       쓰는 그 행렬).  CTML_inv 는 그 전치라 body -> NED, 즉 -yaw 회전이 된다.
+
+       헤딩 0 에서는 두 행렬이 같아 증상이 없고 ±90 도 부근에서 최대가 된다.
+       그래서 SITL (yaw 0 고정) 에서는 드러나지 않았고, 실기체 로그에서 헤딩이
+       -11 ~ +122 도로 돌면서 확인됐다:
+           CTML  (정상)    잔차 0.6598
+           CTML_inv(전치)  잔차 0.0007   <- 원본 코드가 이쪽
+       (검산: TDCV 의 CVN/CVE, CVU/CVV, PSI.  tdcn_log_compare.py 가 자동 판정한다)
+
+       원본:
+           uv_des[0] = CTML_inv[0][0] * pos_dot_des[0] + CTML_inv[0][1] * pos_dot_des[1] + CTML_inv[0][2] * pos_dot_des[2];
+           uv_des[1] = CTML_inv[1][0] * pos_dot_des[0] + CTML_inv[1][1] * pos_dot_des[1] + CTML_inv[1][2] * pos_dot_des[2];
+           uv_des[2] = CTML_inv[2][0] * pos_dot_des[0] + CTML_inv[2][1] * pos_dot_des[1] + CTML_inv[2][2] * pos_dot_des[2];  */
+    uv_des[0] = CTML[0][0] * pos_dot_des[0] + CTML[0][1] * pos_dot_des[1] + CTML[0][2] * pos_dot_des[2];
+    uv_des[1] = CTML[1][0] * pos_dot_des[0] + CTML[1][1] * pos_dot_des[1] + CTML[1][2] * pos_dot_des[2];
+    uv_des[2] = CTML[2][0] * pos_dot_des[0] + CTML[2][1] * pos_dot_des[1] + CTML[2][2] * pos_dot_des[2];
 
     double max_vel = 5.0;
     if (uv_des[0] > max_vel) uv_des[0] = max_vel;
@@ -501,7 +526,23 @@ void CLAW_step(void)
     for (i = 0; i < 3; i++) STV_OLD[i] = STV[i];
 
     CLAW_Y.v_cmd.cmd_height = (real32_T)(Del_Control[0] * CLAW_P.BSC_Scale_Thrust);
-    CLAW_Y.v_cmd.cmd_roll = (real32_T)(Del_Control[1] * CLAW_P.BSC_Scale_Roll * 1.0);
+
+    /* Sejong: 롤 부호 반전 (1.0 -> -1.0).
+       모멘트 명령은 자세 오차를 [줄이는] 방향이어야 하므로 corr(cmd, z1) 이
+       음수여야 한다.  SITL 로그에서 롤만 양수로 나왔다:
+           Roll   corr(cmd_roll,  z1[1]) = +0.910   <- 오차와 같은 방향
+           Pitch  corr(cmd_pitch, z1[2]) = -0.946
+           Yaw    corr(cmd_yaw,   z1[3]) = -0.665
+       오차가 큰 구간만 봐도 같다 - 오차 + 일 때 명령 +0.206, 오차 - 일 때 -0.331
+       로 기울어진 쪽으로 더 밀고 있었다.  폐루프였다면 롤 축이 발산한다.
+       (이 판정은 CLAW 내부값 STV[6] 와 Xtraj[1] 만 쓰므로 v1 개루프와 무관하다)
+
+       목표 자세 생성부(ph_cmd)는 부호가 맞다 - 우측 이동에 +roll 이 나온다.
+       그러니 어긋나는 곳은 Del_Control -> v_cmd 출력 단계다.  근본 원인은
+       BSC_B_mat 의 롤 행 부호일 수 있으나 그 파라미터는 건드리지 않기로 해
+       여기서 맞춘다.  원본:
+           CLAW_Y.v_cmd.cmd_roll = (real32_T)(Del_Control[1] * CLAW_P.BSC_Scale_Roll * 1.0); */
+    CLAW_Y.v_cmd.cmd_roll = (real32_T)(Del_Control[1] * CLAW_P.BSC_Scale_Roll * -1.0);
     CLAW_Y.v_cmd.cmd_pitch = (real32_T)(Del_Control[2] * CLAW_P.BSC_Scale_Pitch * -1.0);
     CLAW_Y.v_cmd.cmd_yaw = (real32_T)(Del_Control[3] * CLAW_P.BSC_Scale_Yaw * 1.0);
 
@@ -518,7 +559,11 @@ void CLAW_step(void)
     else if (CLAW_Y.v_cmd.cmd_height < -1.0F) CLAW_Y.v_cmd.cmd_height = -1.0F;
 
     Prev_CTRL[0] = (double)(CLAW_Y.v_cmd.cmd_height / CLAW_P.BSC_Scale_Thrust);
-    Prev_CTRL[1] = (double)(CLAW_Y.v_cmd.cmd_roll / (CLAW_P.BSC_Scale_Roll * 1.0));
+    /* Sejong: 위 cmd_roll 의 부호 반전에 맞춰 나눗셈 인자도 -1.0 으로 바꿨다.
+       Prev_CTRL 은 v_cmd 에서 Del_Control 을 역산하는 자리라 배율이 같아야 한다
+       (피치는 원래부터 -1.0 로 되어 있다 - 아래 줄 참고).
+       원본: Prev_CTRL[1] = (double)(CLAW_Y.v_cmd.cmd_roll / (CLAW_P.BSC_Scale_Roll * 1.0)); */
+    Prev_CTRL[1] = (double)(CLAW_Y.v_cmd.cmd_roll / (CLAW_P.BSC_Scale_Roll * -1.0));
     Prev_CTRL[2] = (double)(CLAW_Y.v_cmd.cmd_pitch / (CLAW_P.BSC_Scale_Pitch * -1.0));
     Prev_CTRL[3] = (double)(CLAW_Y.v_cmd.cmd_yaw / CLAW_P.BSC_Scale_Yaw * 1.0);
 
