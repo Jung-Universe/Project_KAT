@@ -30,9 +30,7 @@ TDCN_C, CLAW_C = "#1f77b4", "#d62728"      # mode_tdcn.cpp 파랑, CLAW 빨강
 
 LOG_DIRS = (
     "logs",
-    os.path.expanduser("~/logs"),
-    os.path.expanduser("~/Desktop/KAT/logs"),
-    os.path.expanduser("~/Desktop/KAT/ardupilot/ArduCopter/logs"),
+    os.path.expanduser("~/Desktop/KAT/ardupilot/logs"),
 )
 
 # 인터페이스 검증 대상.
@@ -249,10 +247,12 @@ def fig1(plt, d):
                 continue
             msg, tk, ck, nm, unit, mul, dunit = items[r]
             q = d[msg]
-            ax.plot(q["t"], q[tk], color=TDCN_C, lw=2.4, alpha=0.55,
-                    label="TDCN 이 넘긴 값")
-            ax.plot(q["t"], q[ck], color=CLAW_C, lw=1.0, ls="--",
+            # CLAW 를 먼저(아래) 그리고 TDCN 을 위에 올린다.  CLAW 값이 커서
+            # 위에 그리면 TDCN 값을 덮어 가린다.
+            ax.plot(q["t"], q[ck], color=CLAW_C, lw=2.4, alpha=0.55,
                     label="CLAW 가 받은 값")
+            ax.plot(q["t"], q[tk], color=TDCN_C, lw=1.0, ls="--",
+                    label="TDCN 이 넘긴 값")
 
             # 차이가 있을 때만 적는다.  없으면 아무 표시도 하지 않는다.
             dif = diff_of(q, tk, ck, mul)
@@ -289,8 +289,9 @@ def fig2(plt, d):
 
     for i, (ak, ck, nm, unit) in enumerate(FIG2_ROWS):
         ax = axs[i][0]
-        ax.plot(q["t"], q[ak], color=TDCN_C, lw=2.0, alpha=0.65, label="아두파일럿")
-        ax.plot(q["t"], q[ck], color=CLAW_C, lw=1.0, ls="--", label="CLAW")
+        # CLAW 를 먼저(아래), 아두파일럿을 위에 올린다.
+        ax.plot(q["t"], q[ck], color=CLAW_C, lw=2.0, alpha=0.65, label="CLAW")
+        ax.plot(q["t"], q[ak], color=TDCN_C, lw=1.0, ls="--", label="아두파일럿")
         ax.set_title(f"{nm}  [{unit}]", fontsize=10)
         ax.set_ylabel(unit, fontsize=9)
         ax.grid(alpha=0.3)
@@ -356,8 +357,9 @@ def fig3(plt, d):
         rng = "0 ~ 1" if off else "-1 ~ +1"
 
         ax = axs[i][0]
-        ax.plot(q["t"], q[ak], color=TDCN_C, lw=1.0, label="아두파일럿")
-        ax.plot(q["t"], claw, color=CLAW_C, lw=1.0, alpha=0.85, label="CLAW")
+        # CLAW 를 먼저(아래), 아두파일럿을 위에 올린다.
+        ax.plot(q["t"], claw, color=CLAW_C, lw=2.0, alpha=0.55, label="CLAW")
+        ax.plot(q["t"], q[ak], color=TDCN_C, lw=1.0, ls="--", label="아두파일럿")
         ax.set_title(f"{nm}   [{rng}]", fontsize=10)
         ax.set_ylabel("정규화", fontsize=9)
         ax.grid(alpha=0.3)

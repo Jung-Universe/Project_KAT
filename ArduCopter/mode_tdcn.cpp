@@ -413,6 +413,7 @@ bool ModeTDCN::init(bool ignore_checks)
     _in_p = _in_q = _in_r = 0.0f;
     _in_roll = _in_pitch = _in_yaw = 0.0f;
     _in_ship_hdg = 0.0f;
+    _ap_roll_out = _ap_pitch_out = _ap_yaw_out = _ap_throttle_out = 0.0f;
 
     // CLAW 상시 실행 - 모니터링을 위해 모드에 있는 동안은 계속 돌린다
     Arming = 1;
@@ -586,6 +587,19 @@ MAV_RESULT ModeTDCN::GCS_command(const mavlink_command_int_t &packet)
             break;
 
         default:
+            return MAV_RESULT_DENIED;
+        }
+
+        // z 는 home 기준 상대고도다.  기준점이 없으면 아래 set_alt_cm 이
+        // 붙이는 ABOVE_HOME 플래그가 의미를 잃는다.  그때 명령을 수락해 두면
+        // state 6 의 get_vector_from_origin_NEU() 가 고도 변환 단계에서
+        // 조용히 실패하고 (Location::get_alt_cm 의 ABOVE_HOME 분기),
+        // 위경도는 변환조차 되지 않은 채 직전 타겟이 유지된다.  GCS 는
+        // ACCEPTED 를 받았으므로 타겟이 반영된 줄로 안다.
+        //
+        // frame 1 은 자체 검사가 있지만 이 줄은 두 frame 이 공유하므로
+        // 여기서 막는다 (frame 1 을 제거해도 검사가 남는다).
+        if (!ahrs.home_is_set()) {
             return MAV_RESULT_DENIED;
         }
 
@@ -964,10 +978,10 @@ void ModeTDCN::Log_Write_TDCN()
                                 // get_roll() 은 _roll_in 만이라 그것만 비교하면
                                 // 아두파일럿 몫을 과소평가한다.  스로틀은
                                 // 피드포워드가 없어 get_throttle() 그대로다.
-                                (double)(motors->get_roll()  + motors->get_roll_ff()),
-                                (double)(motors->get_pitch() + motors->get_pitch_ff()),
-                                (double)(motors->get_yaw()   + motors->get_yaw_ff()),
-                                (double)motors->get_throttle(),
+                                (double)_ap_roll_out,
+                                (double)_ap_pitch_out,
+                                (double)_ap_yaw_out,
+                                (double)_ap_throttle_out,
                                 // CLAW.c 의 스케일 순서를 그대로 재현한다.
                                 // clamp 만 빼면 CR..CH 와 같아야 하므로,
                                 // 벌어지는 구간이 곧 포화 구간이다.
@@ -1067,44 +1081,63 @@ bool ModeTDCN::claw_output_active() const
 // [피드포워드] motors 믹서는 (_roll_in + _roll_in_ff) 를 쓴다.  CLAW 값만
 // 넣고 ff 를 두면 아두파일럿 몫이 섞이므로 ff 는 0 으로 지운다.
 //
-// [스로틀] 범위와 기준점이 둘 다 다르다.
+// [스로틀] 범위만 맞춘다.  CLAW 는 -1 ~ +1, 믹서는 0 ~ 1 이므로
 //
-//   CLAW   cmd_height  -1 ~ +1,  0 이 호버
-//   믹서   throttle     0 ~  1,  호버는 기체마다 다르다 (MOT_THST_HOVER)
+//     thr = (cmd_height + 1) / 2
 //
-// CLAW 의 0 이 호버라는 것은 로그로 확인했다.  아두파일럿이 고도를 잡고 있던
-// 7101 샘플에서 cmd_height 평균이 +0.0009 (표준편차 0.018) 였고, 같은 구간
-// 실제 스로틀은 0.332 였다.  즉 "고도 오차가 없을 때 0 을 낸다" 는 뜻이므로
-// cmd_height 는 절대 스로틀이 아니라 [호버 기준 증분] 이다.
+//     cmd_height  -1  ->  0.0
+//     cmd_height   0  ->  0.5
+//     cmd_height  +1  ->  1.0
 //
-// 그래서 0 을 그 기체의 실제 호버값에 맞춘다.  중앙에서 위아래 여유가 다르므로
-// 꺾인 직선이 된다 (아두파일럿이 조종기 스로틀 스틱을 처리하는 방식과 같다):
+// [왜 호버 보정을 하지 않는가]
 //
-//     cmd_height  -1  ->  0        무추력
-//     cmd_height   0  ->  hover    MOT_THST_HOVER
-//     cmd_height  +1  ->  1        최대
+// 이 단계의 목적은 CLAW 를 있는 그대로 통합하는 것이다.  기준점 보정은 통합이
+// 아니라 제어 설계의 문제이므로 CLAW 쪽에서 다룬다.  여기서 보정하면 CLAW 가
+// 자기 출력이 기체에 어떻게 반영되는지 알 수 없게 되고, 게인을 판정할 때
+// 통합 코드가 끼워 넣은 비선형이 섞인다.
 //
-// 호버값은 get_throttle_hover() 로 읽는다.  아두파일럿이 비행 중 학습해 갱신
-// 하므로 기체가 바뀌어도 자동으로 맞는다.  상수로 박으면 실기체(무거워서 0.5~0.6)
-// 에서 어긋난다.
+// 그래서 로그 스크립트(TDCN/tdcn_log_compare.py Figure 3)와 환산이 같다.
+// 스크립트가 CH 를 (x+1)/2 로 그리므로 그래프의 CLAW 선이 곧 믹서 입력이다.
 //
-// 앞서 쓰던 (x+1)/2 는 0 을 0.5 로 보냈다.  호버가 0.334 인 이 기체에서는
-// 인계 순간 +0.17 (호버 대비 +50%) 짜리 스로틀 계단이 주입돼 튀어올랐고,
-// CLAW 가 그것을 되돌리려다 진동했다.
+// [알려진 영향]  CLAW 의 0 은 호버를 뜻한다.  아두파일럿이 고도를 잡고 있던
+// 7101 샘플에서 cmd_height 평균이 +0.0009 (표준편차 0.018) 였고 같은 구간
+// 실제 스로틀은 0.332 였다.  즉 cmd_height 는 절대 스로틀이 아니라 호버 기준
+// 증분이다.  (x+1)/2 는 그 0 을 0.5 로 보내므로, 호버가 0.5 가 아닌 기체에서는
+// 인계 순간 (0.5 - hover) 만큼의 스로틀 계단이 들어간다.  호버 0.334 기체에서
+// +0.17 (호버 대비 +50%) 이 주입돼 튀어오른 것을 확인했다.
+//
+// 이 계단은 통합 검증 단계에서 감수한다.  고도 거동이 문제가 되면 그때
+// 기준점 보정을 CLAW 쪽 또는 이 자리에서 다시 검토한다.
 // ---------------------------------------------------------------------------
 
 void ModeTDCN::output_to_motors()
 {
+    // 아두파일럿 값을 먼저 잡아둔다.  아래에서 CLAW 값으로 덮어쓰면 이 값은
+    // 어디에도 남지 않는다.  TDCC 로그의 MR/MP/MY/MT 가 이것을 쓴다.
+    //
+    // 롤/피치/요는 get_roll() 등이 _roll_in 을 그대로 주므로 이 시점 값이
+    // 곧 run_rate_controller() 가 방금 넣은 아두파일럿 출력이다.
+    //
+    // 스로틀은 motors->get_throttle() 을 쓸 수 없다.  그것은 _throttle_filter
+    // 값이고 필터는 AP_MotorsMulticopter::output() 안에서 갱신되는데, output()
+    // 은 아래 Mode::output_to_motors() 에서 불린다.  즉 이 시점의 필터값은
+    // [직전 루프에 CLAW 값으로 갱신된 것] 이다.  아두파일럿 자기 요구값은
+    // attitude_control 이 들고 있다 (set_throttle_out 이 넣은 _throttle_in,
+    // angle boost 적용 전).  이 값은 pos_control->update_z_controller() 가
+    // 갱신하고 그것은 Run_CLAW() 뒤에 오므로 한 루프 늦다.
+    _ap_roll_out     = motors->get_roll()  + motors->get_roll_ff();
+    _ap_pitch_out    = motors->get_pitch() + motors->get_pitch_ff();
+    _ap_yaw_out      = motors->get_yaw()   + motors->get_yaw_ff();
+    _ap_throttle_out = attitude_control->get_throttle_in();
+
     if (claw_output_active()) {
         motors->set_roll(constrain_float(CLAW_Y.v_cmd.cmd_roll,  -1.0f, 1.0f));
         motors->set_pitch(constrain_float(CLAW_Y.v_cmd.cmd_pitch, -1.0f, 1.0f));
         motors->set_yaw(constrain_float(CLAW_Y.v_cmd.cmd_yaw,   -1.0f, 1.0f));
 
-        const float hover = motors->get_throttle_hover();
-        const float ch    = constrain_float(CLAW_Y.v_cmd.cmd_height, -1.0f, 1.0f);
-        const float thr   = is_negative(ch) ? hover * (1.0f + ch)
-                                            : hover + ch * (1.0f - hover);
-        motors->set_throttle(constrain_float(thr, 0.0f, 1.0f));
+        // 범위만 맞춘다: -1 ~ +1  ->  0 ~ 1  (호버 보정 없음, 위 주석 참조)
+        const float ch = constrain_float(CLAW_Y.v_cmd.cmd_height, -1.0f, 1.0f);
+        motors->set_throttle(constrain_float((ch + 1.0f) * 0.5f, 0.0f, 1.0f));
 
         // 아두파일럿 각속도 PID 의 피드포워드가 더해지지 않게 지운다
         motors->set_roll_ff(0.0f);

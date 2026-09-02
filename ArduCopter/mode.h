@@ -2039,6 +2039,17 @@ private:
     float  _in_roll, _in_pitch, _in_yaw;            // rad
     float  _in_ship_hdg;                            // rad, 진북
 
+    // 아두파일럿 rate PID 출력 스냅샷.
+    //
+    // output_to_motors() 가 CLAW 값으로 motors 를 덮어쓰기 전에 잡아둔다.
+    // 로깅은 update_flight_mode() 안에서 일어나는데 그것은 motors_output()
+    // 보다 뒤이므로, 로깅 시점에 motors->get_*() 를 읽으면 CLAW 값이 나온다.
+    // (그러면 인계 중 TDCC 의 MR/MP/MY/MT 가 CLAW 를 자기 자신과 비교하게 된다)
+    float  _ap_roll_out;
+    float  _ap_pitch_out;
+    float  _ap_yaw_out;
+    float  _ap_throttle_out;
+
     // --- 파라미터 ---
     //
     // 소스에 박아 두면 값을 바꿀 때마다 재빌드해야 하고, 실기체에서는 현장에서
