@@ -125,12 +125,37 @@ const AP_Param::GroupInfo ModeTDCN::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("LND_SPD", 4, ModeTDCN, _land_spd, 100),
 
-    // @Param: CLAW_ON_OFF
-    // @DisplayName: TDCN use CLAW control output
-    // @Description: 0 leaves ArduPilot flying the vehicle with CLAW running in parallel for monitoring only. 1 replaces the ArduPilot roll pitch yaw and throttle mixer inputs with the CLAW output during state 6 tracking. Only take off with 1 after the CLAW gains have been verified for this airframe.
-    // @Values: 0:ArduPilot flies CLAW monitors,1:CLAW flies
+    // @Param: SC_ROLL
+    // @DisplayName: TDCN CLAW roll output scale to stick PWM
+    // @Description: CLAW cmd_roll of 1.0 is fed to the loiter controller as if the pilot moved the roll stick this many PWM microseconds away from RC1_TRIM. Reproduces the external computer that generated SBUS from the CLAW output on the original hardware.
+    // @Units: PWM
+    // @Range: 0 500
     // @User: Advanced
-    AP_GROUPINFO("CLAW_ON_OFF", 5, ModeTDCN, _claw_on_off, 0),
+    AP_GROUPINFO("SC_ROLL", 5, ModeTDCN, _sc_roll, 250),
+
+    // @Param: SC_PITCH
+    // @DisplayName: TDCN CLAW pitch output scale to stick PWM
+    // @Description: CLAW cmd_pitch of 1.0 expressed as PWM microseconds away from RC2_TRIM
+    // @Units: PWM
+    // @Range: 0 500
+    // @User: Advanced
+    AP_GROUPINFO("SC_PITCH", 6, ModeTDCN, _sc_pitch, 250),
+
+    // @Param: SC_YAW
+    // @DisplayName: TDCN CLAW yaw output scale to stick PWM
+    // @Description: CLAW cmd_yaw of 1.0 expressed as PWM microseconds away from RC4_TRIM
+    // @Units: PWM
+    // @Range: 0 500
+    // @User: Advanced
+    AP_GROUPINFO("SC_YAW", 7, ModeTDCN, _sc_yaw, 80),
+
+    // @Param: SC_THR
+    // @DisplayName: TDCN CLAW height output scale to stick PWM
+    // @Description: CLAW cmd_height of 1.0 expressed as PWM microseconds away from RC3_TRIM
+    // @Units: PWM
+    // @Range: 0 500
+    // @User: Advanced
+    AP_GROUPINFO("SC_THR", 8, ModeTDCN, _sc_thr, 250),
 
     AP_GROUPEND
 };
@@ -413,7 +438,12 @@ bool ModeTDCN::init(bool ignore_checks)
     _in_p = _in_q = _in_r = 0.0f;
     _in_roll = _in_pitch = _in_yaw = 0.0f;
     _in_ship_hdg = 0.0f;
-    _ap_roll_out = _ap_pitch_out = _ap_yaw_out = _ap_throttle_out = 0.0f;
+
+    // CLAW -> LOITER 입력 스냅샷 (로그용).  state 6 에 들어가야 채워진다.
+    _stick_mask = 0;
+    _sim_pwm[0] = _sim_pwm[1] = _sim_pwm[2] = _sim_pwm[3] = 0.0f;
+    _loiter_roll_cd = _loiter_pitch_cd = 0.0f;
+    _loiter_yaw_cds = _loiter_climb_cms = 0.0f;
 
     // CLAW 상시 실행 - 모니터링을 위해 모드에 있는 동안은 계속 돌린다
     Arming = 1;
@@ -962,9 +992,9 @@ void ModeTDCN::Log_Write_TDCN()
 // @Field: UP: CLAW pitch command before clamp
 // @Field: UY: CLAW yaw command before clamp
 // @Field: UH: CLAW height command before clamp
-// @Field: ACT: 1 when the CLAW output is actually driving the mixer
+// @Field: STK: Pilot stick override bitmask, bit0 roll pitch, bit1 yaw, bit2 throttle
     AP::logger().WriteStreaming("TDCC",
-                                "TimeUS,CR,CP,CY,CH,MR,MP,MY,MT,UR,UP,UY,UH,ACT",
+                                "TimeUS,CR,CP,CY,CH,MR,MP,MY,MT,UR,UP,UY,UH,STK",
                                 "QffffffffffffB",
                                 now_us,
                                 (double)CLAW_Y.v_cmd.cmd_roll,
@@ -975,13 +1005,14 @@ void ModeTDCN::Log_Write_TDCN()
                                 // AP_MotorsMatrix::output_armed_stabilizing() 은
                                 //   roll_thrust = (_roll_in + _roll_in_ff) * gain
                                 // 처럼 rate PID 출력에 피드포워드를 더해 쓴다.
-                                // get_roll() 은 _roll_in 만이라 그것만 비교하면
-                                // 아두파일럿 몫을 과소평가한다.  스로틀은
-                                // 피드포워드가 없어 get_throttle() 그대로다.
-                                (double)_ap_roll_out,
-                                (double)_ap_pitch_out,
-                                (double)_ap_yaw_out,
-                                (double)_ap_throttle_out,
+                                //
+                                // 이제 CLAW 가 믹서를 덮어쓰지 않으므로 (직렬
+                                // 구조에서는 LOITER 를 거쳐 들어간다) 이 시점의
+                                // motors 값이 곧 아두파일럿 자신의 출력이다.
+                                (double)(motors->get_roll()  + motors->get_roll_ff()),
+                                (double)(motors->get_pitch() + motors->get_pitch_ff()),
+                                (double)(motors->get_yaw()   + motors->get_yaw_ff()),
+                                (double)motors->get_throttle(),
                                 // CLAW.c 의 스케일 순서를 그대로 재현한다.
                                 // clamp 만 빼면 CR..CH 와 같아야 하므로,
                                 // 벌어지는 구간이 곧 포화 구간이다.
@@ -989,10 +1020,35 @@ void ModeTDCN::Log_Write_TDCN()
                                 (double)(Del_Control[2] * CLAW_P.BSC_Scale_Pitch * -1.0),
                                 (double)(Del_Control[3] * CLAW_P.BSC_Scale_Yaw),
                                 (double)(Del_Control[0] * CLAW_P.BSC_Scale_Thrust),
-                                // CLAW 출력이 실제로 믹서를 몰고 있는가.
-                                // TDCN_CLAW_ON_OFF 를 켰어도 state / home_init /
-                                // 비행 여부 조건이 안 맞으면 0 이다.
-                                (uint8_t)(claw_output_active() ? 1 : 0));
+                                // 조종자가 스틱으로 덮어쓴 축.  state 6 의
+                                // claw_to_loiter_input() 이 채운다.
+                                (uint8_t)_stick_mask);
+
+// @LoggerMessage: TDCK
+// @Description: TDCN CLAW output turned into loiter stick input
+// @Field: TimeUS: Time since system startup
+// @Field: SR: Synthesised roll stick PWM from CLAW output
+// @Field: SP: Synthesised pitch stick PWM from CLAW output
+// @Field: SY: Synthesised yaw stick PWM from CLAW output
+// @Field: ST: Synthesised throttle stick PWM from CLAW output
+// @Field: LR: Roll angle command fed to the loiter controller
+// @Field: LP: Pitch angle command fed to the loiter controller
+// @Field: LY: Yaw rate command fed to the attitude controller
+// @Field: LT: Climb rate command fed to the position controller
+// @Field: STK: Pilot stick override bitmask, bit0 roll pitch, bit1 yaw, bit2 throttle
+    AP::logger().WriteStreaming("TDCK",
+                                "TimeUS,SR,SP,SY,ST,LR,LP,LY,LT,STK",
+                                "QffffffffB",
+                                now_us,
+                                (double)_sim_pwm[0],
+                                (double)_sim_pwm[1],
+                                (double)_sim_pwm[2],
+                                (double)_sim_pwm[3],
+                                (double)_loiter_roll_cd,
+                                (double)_loiter_pitch_cd,
+                                (double)_loiter_yaw_cds,
+                                (double)_loiter_climb_cms,
+                                (uint8_t)_stick_mask);
 
 // @LoggerMessage: TDCE
 // @Description: TDCN CLAW controller internal state
@@ -1041,112 +1097,6 @@ void ModeTDCN::Log_Write_TDCN()
 // v1 은 CLAW 출력을 기체에 적용하지 않고 로그로만 확인한다.
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// CLAW 출력을 믹서에 넣어도 되는 상태인가
-//
-// 아래를 모두 만족해야 한다.  하나라도 어긋나면 아두파일럿이 계속 몬다.
-//
-//   TDCN_CLAW_ON_OFF == 1   조작자가 명시적으로 켰는가
-//   state 6                 CLAW 가 도는 유일한 state.  다른 state 에서는
-//                           CLAW_Y 가 갱신되지 않아 낡은 값이 나간다
-//   home_init               CLAW 가 home 을 잡기 전에는 STV[9..11] 이 0 이라
-//                           오차가 통째로 틀리다
-//   비행 중                 지상에서 넣으면 make_safe_ground_handling() 과
-//                           싸우게 된다
-// ---------------------------------------------------------------------------
-
-bool ModeTDCN::claw_output_active() const
-{
-    return _claw_on_off == 1
-           && _state == State::TRACKING
-           && home_init
-           && motors->armed()
-           && !is_disarmed_or_landed();
-}
-
-// ---------------------------------------------------------------------------
-// 믹서 직전 훅
-//
-// Copter 의 fast loop 는 run_rate_controller() 로 제어값을 만들어 motors 에
-// 넣어두고, 그 뒤 motors_output() 이 그 값으로 모터를 돌린다.  이 함수는
-// motors_output() 이 flightmode->output_to_motors() 로 부르는 자리이므로,
-// [계산은 끝났고 아직 모터로 안 나간] 시점이다.  여기서 갈아끼운다.
-//
-// run_rate_controller() 자체를 건너뛰지 않는 이유:
-//   - 각속도 PID 의 적분항과 필터가 계속 갱신되어, CLAW 를 껐을 때 (또는
-//     조건이 깨져 아두파일럿으로 돌아올 때) 튀지 않는다
-//   - attitude_control 의 목표 자세도 살아 있어 다른 state 로 넘어갈 때
-//     인수인계가 매끄럽다
-//
-// [피드포워드] motors 믹서는 (_roll_in + _roll_in_ff) 를 쓴다.  CLAW 값만
-// 넣고 ff 를 두면 아두파일럿 몫이 섞이므로 ff 는 0 으로 지운다.
-//
-// [스로틀] 범위만 맞춘다.  CLAW 는 -1 ~ +1, 믹서는 0 ~ 1 이므로
-//
-//     thr = (cmd_height + 1) / 2
-//
-//     cmd_height  -1  ->  0.0
-//     cmd_height   0  ->  0.5
-//     cmd_height  +1  ->  1.0
-//
-// [왜 호버 보정을 하지 않는가]
-//
-// 이 단계의 목적은 CLAW 를 있는 그대로 통합하는 것이다.  기준점 보정은 통합이
-// 아니라 제어 설계의 문제이므로 CLAW 쪽에서 다룬다.  여기서 보정하면 CLAW 가
-// 자기 출력이 기체에 어떻게 반영되는지 알 수 없게 되고, 게인을 판정할 때
-// 통합 코드가 끼워 넣은 비선형이 섞인다.
-//
-// 그래서 로그 스크립트(TDCN/tdcn_log_compare.py Figure 3)와 환산이 같다.
-// 스크립트가 CH 를 (x+1)/2 로 그리므로 그래프의 CLAW 선이 곧 믹서 입력이다.
-//
-// [알려진 영향]  CLAW 의 0 은 호버를 뜻한다.  아두파일럿이 고도를 잡고 있던
-// 7101 샘플에서 cmd_height 평균이 +0.0009 (표준편차 0.018) 였고 같은 구간
-// 실제 스로틀은 0.332 였다.  즉 cmd_height 는 절대 스로틀이 아니라 호버 기준
-// 증분이다.  (x+1)/2 는 그 0 을 0.5 로 보내므로, 호버가 0.5 가 아닌 기체에서는
-// 인계 순간 (0.5 - hover) 만큼의 스로틀 계단이 들어간다.  호버 0.334 기체에서
-// +0.17 (호버 대비 +50%) 이 주입돼 튀어오른 것을 확인했다.
-//
-// 이 계단은 통합 검증 단계에서 감수한다.  고도 거동이 문제가 되면 그때
-// 기준점 보정을 CLAW 쪽 또는 이 자리에서 다시 검토한다.
-// ---------------------------------------------------------------------------
-
-void ModeTDCN::output_to_motors()
-{
-    // 아두파일럿 값을 먼저 잡아둔다.  아래에서 CLAW 값으로 덮어쓰면 이 값은
-    // 어디에도 남지 않는다.  TDCC 로그의 MR/MP/MY/MT 가 이것을 쓴다.
-    //
-    // 롤/피치/요는 get_roll() 등이 _roll_in 을 그대로 주므로 이 시점 값이
-    // 곧 run_rate_controller() 가 방금 넣은 아두파일럿 출력이다.
-    //
-    // 스로틀은 motors->get_throttle() 을 쓸 수 없다.  그것은 _throttle_filter
-    // 값이고 필터는 AP_MotorsMulticopter::output() 안에서 갱신되는데, output()
-    // 은 아래 Mode::output_to_motors() 에서 불린다.  즉 이 시점의 필터값은
-    // [직전 루프에 CLAW 값으로 갱신된 것] 이다.  아두파일럿 자기 요구값은
-    // attitude_control 이 들고 있다 (set_throttle_out 이 넣은 _throttle_in,
-    // angle boost 적용 전).  이 값은 pos_control->update_z_controller() 가
-    // 갱신하고 그것은 Run_CLAW() 뒤에 오므로 한 루프 늦다.
-    _ap_roll_out     = motors->get_roll()  + motors->get_roll_ff();
-    _ap_pitch_out    = motors->get_pitch() + motors->get_pitch_ff();
-    _ap_yaw_out      = motors->get_yaw()   + motors->get_yaw_ff();
-    _ap_throttle_out = attitude_control->get_throttle_in();
-
-    if (claw_output_active()) {
-        motors->set_roll(constrain_float(CLAW_Y.v_cmd.cmd_roll,  -1.0f, 1.0f));
-        motors->set_pitch(constrain_float(CLAW_Y.v_cmd.cmd_pitch, -1.0f, 1.0f));
-        motors->set_yaw(constrain_float(CLAW_Y.v_cmd.cmd_yaw,   -1.0f, 1.0f));
-
-        // 범위만 맞춘다: -1 ~ +1  ->  0 ~ 1  (호버 보정 없음, 위 주석 참조)
-        const float ch = constrain_float(CLAW_Y.v_cmd.cmd_height, -1.0f, 1.0f);
-        motors->set_throttle(constrain_float((ch + 1.0f) * 0.5f, 0.0f, 1.0f));
-
-        // 아두파일럿 각속도 PID 의 피드포워드가 더해지지 않게 지운다
-        motors->set_roll_ff(0.0f);
-        motors->set_pitch_ff(0.0f);
-        motors->set_yaw_ff(0.0f);
-    }
-
-    Mode::output_to_motors();
-}
 
 void ModeTDCN::Run_CLAW()
 {
@@ -1512,18 +1462,181 @@ void ModeTDCN::state_flight_wait()      // 5 비행 대기
 }
 
 // ---------------------------------------------------------------------------
-// state 6 (추종 비행) - CLAW 검증 모드
+// CLAW 출력 -> 조종기 스틱 등가 -> LOITER 입력
 //
-// [목적] CLAW 는 외부에서 받은 코드이고 기체도 달라 게인이 맞지 않는다.  그래서
-//        먼저 SITL 에서 CLAW 를 검증한다.
+// [왜 이렇게 하는가]
 //
-//   기체 제어 : 아두파일럿 위치제어가 GCS 타겟을 실제로 따라간다 (GUIDED 방식)
-//   CLAW      : 같은 입력으로 병렬 실행.  출력은 로그로만 남기고 기체에 쓰지 않는다
-//   비교      : TDCN 로그의 PN/PE/PU (CLAW 계산 위치) 와 CR/CP/CY/CH (CLAW 제어값) 를
-//               아두파일럿이 실제로 만든 거동과 대조해 CLAW 를 판정한다
+// 원래 하드웨어는 세 장치가 SBUS 로 묶여 있었다.
 //
-// [기반 모드] GUIDED (Position 서브모드) - state 5 와 동일한 제어 경로다.
-//             차이는 목표가 "이륙 위치 고정" 이 아니라 "GCS 가 주는 타겟" 이라는 점.
+//     조종기  <->  외부컴퓨터(CLAW)  <->  FC
+//
+// 외부컴퓨터가 CLAW 를 돌리고 그 출력을
+//
+//     PWM = RCn_TRIM + CLAW출력(-1~+1) x 스케일
+//
+// 로 SBUS 에 실어 FC 로 보냈다.  FC 는 그것을 평범한 조종기 입력으로 받아
+// LOITER 로 날았다.  CLAW 게인은 그 구성 전체에 맞춰 튜닝되어 있다.
+//
+// 이제 외부컴퓨터를 없애고 FC 안에서 CLAW 를 돌리므로, 거동을 유지하려면
+// 같은 경로를 그대로 재현해야 한다.  스케일 상수(TDCN_SC_*)를 물리 단위로
+// 직접 곱하면 안 된다 - 그 상수는 PWM 오프셋이고, 실제 물리량은 아래 경로를
+// 거치면서 RCn_MIN/TRIM/MAX, 채널 데드존, ANGLE_MAX, PILOT_Y_RATE,
+// PILOT_SPEED_UP/DN, THR_DZ 가 함께 정한다.
+//
+// [경로]
+//
+//   CLAW 출력 (-1 ~ +1)
+//     -> 가상 PWM        = RCn_TRIM + 출력 x TDCN_SC_*      (외부컴퓨터가 하던 일)
+//     -> control_in      pwm_to_angle_dz_trim 과 같은 계산   (SBUS 수신부)
+//     -> 물리 명령       rc_input_to_roll_pitch 등           (LOITER 의 pilot 함수)
+//
+// 기본 스케일(250/250/80/250) 과 기본 RC 캘리브레이션에서 나오는 값:
+//
+//     롤 / 피치   +-9.6 deg      자세각
+//     요          +-25.3 deg/s   각속도
+//     스로틀      +94 / -56 cm/s 상승률   (UP 250, DN 150, THR_DZ 로 비대칭)
+//
+// [조종기 우선]  원래는 외부컴퓨터가 조종기와 CLAW 를 섞었다.  FC 안에서는 그
+// 지점이 없으므로 여기서 정한다.  스틱이 데드존을 벗어난 축은 조종자가 이긴다.
+// 데드존 안이면 control_in / norm_input_dz 가 정확히 0 을 주므로 그것으로
+// 판정한다 (기본 데드존 PWM 기준 롤/피치 20, 요 20, 스로틀 30).
+//
+// [전제]  state 6 에 들어갈 때 조종자는 스로틀 스틱을 중앙에 둔다.  스로틀은
+// 스프링으로 중립에 돌아오지 않으므로 이것은 코드가 아니라 운용으로 지키는
+// 전제다.  스틱이 중앙에 있으면 control_in 이 THR_DZ 데드밴드 안이라
+// get_pilot_desired_climb_rate() 가 0 을 주고, 스로틀은 CLAW 가 갖는다.
+// 내려둔 채로 들어가면 그 자리가 곧 하강 명령으로 읽혀 CLAW 스로틀이 무시된다.
+// (SITL 은 RC3 을 1000 으로 시작하므로 rc 3 1500 을 먼저 줘야 한다.)
+// ---------------------------------------------------------------------------
+
+void ModeTDCN::claw_to_loiter_input(float &roll_cd, float &pitch_cd,
+                                    float &yaw_cds, float &climb_cms,
+                                    uint8_t &stick_mask,
+                                    float pwm_out[4])
+{
+    stick_mask = 0;
+
+    // --- CLAW 출력을 가상 스틱 PWM 으로 (외부컴퓨터가 하던 계산) ---
+    const float claw[4] = {
+        constrain_float(CLAW_Y.v_cmd.cmd_roll,   -1.0f, 1.0f),
+        constrain_float(CLAW_Y.v_cmd.cmd_pitch,  -1.0f, 1.0f),
+        constrain_float(CLAW_Y.v_cmd.cmd_yaw,    -1.0f, 1.0f),
+        constrain_float(CLAW_Y.v_cmd.cmd_height, -1.0f, 1.0f),
+    };
+    const float scale[4] = { _sc_roll, _sc_pitch, _sc_yaw, _sc_thr };
+    RC_Channel *ch[4] = { channel_roll, channel_pitch, channel_yaw, channel_throttle };
+
+    for (uint8_t i = 0; i < 4; i++) {
+        pwm_out[i] = (float)ch[i]->get_radio_trim() + claw[i] * scale[i];
+    }
+
+    // --- 가상 PWM -> 정규화 스틱값 (RC_Channel 의 계산을 그대로 옮긴다) ---
+    //
+    // 데드존 / 트림 / 상하 비대칭까지 같아야 실기체와 같은 값이 나온다.
+    // reversed 는 적용하지 않는다.  외부컴퓨터가 이미 FC 가 기대하는 방향으로
+    // 만들어 보냈으므로, CLAW 출력의 부호가 곧 조종기 방향이다.
+    // 데드존 / 트림 / 상하 비대칭까지 같아야 실기체와 같은 값이 나온다.
+    // 데드존을 CLAW 값에도 그대로 적용한다.  외부컴퓨터가 SBUS 로 보낸 PWM 을
+    // FC 가 받을 때 실기체에서도 똑같이 적용되던 것이고, 실기체의 RCn_DZ /
+    // THR_DZ 를 SITL 에 넣으면 그대로 재현되게 하기 위해서다.
+    auto pwm_to_unit = [](const RC_Channel *c, float pwm) -> float {
+        const float trim = c->get_radio_trim();
+        const float dz   = c->get_dead_zone();
+        const float mn   = c->get_radio_min();
+        const float mx   = c->get_radio_max();
+        const float hi   = trim + dz;
+        const float lo   = trim - dz;
+        pwm = constrain_float(pwm, mn, mx);
+        if (pwm > hi && !is_equal(mx, hi)) {
+            return (pwm - hi) / (mx - hi);
+        }
+        if (pwm < lo && !is_equal(lo, mn)) {
+            return (pwm - lo) / (lo - mn);
+        }
+        return 0.0f;
+    };
+
+    float u_roll  = pwm_to_unit(channel_roll,  pwm_out[0]);
+    float u_pitch = pwm_to_unit(channel_pitch, pwm_out[1]);
+    float u_yaw   = pwm_to_unit(channel_yaw,   pwm_out[2]);
+
+    // --- 조종기 우선 ---
+    //
+    // 롤과 피치는 rc_input_to_roll_pitch() 가 원형 제한으로 함께 묶으므로
+    // 한 쌍으로 다룬다.  둘 중 하나라도 데드존을 벗어나면 두 축 모두 조종자.
+    const float p_roll  = channel_roll->get_control_in()  * (1.0f / ROLL_PITCH_YAW_INPUT_MAX);
+    const float p_pitch = channel_pitch->get_control_in() * (1.0f / ROLL_PITCH_YAW_INPUT_MAX);
+    if (!copter.failsafe.radio && (!is_zero(p_roll) || !is_zero(p_pitch))) {
+        u_roll  = p_roll;
+        u_pitch = p_pitch;
+        stick_mask |= (1U << 0);
+    }
+
+    const float p_yaw = channel_yaw->norm_input_dz();
+    if (!copter.failsafe.radio && !is_zero(p_yaw)) {
+        u_yaw = p_yaw;
+        stick_mask |= (1U << 1);
+    }
+
+    // --- 정규화 스틱값 -> LOITER 가 받는 물리 명령 ---
+    //
+    // LOITER(ModeLoiter::run) 가 쓰는 것과 같은 함수 / 같은 한계값이다.
+    float roll_deg, pitch_deg;
+    rc_input_to_roll_pitch(u_roll, u_pitch,
+                           loiter_nav->get_angle_max_cd() * 0.01f,
+                           attitude_control->get_althold_lean_angle_max_cd() * 0.01f,
+                           roll_deg, pitch_deg);
+    roll_cd  = roll_deg  * 100.0f;
+    pitch_cd = pitch_deg * 100.0f;
+
+    // 요.  get_pilot_desired_yaw_rate() 와 같은 식이다 (PILOT_Y_RATE / _EXPO).
+    yaw_cds = g2.command_model_pilot.get_rate() * 100.0f
+              * input_expo(u_yaw, g2.command_model_pilot.get_expo());
+
+    // 스로틀.  get_pilot_desired_climb_rate() 가 control_in(0~1000) 을 받으므로
+    // 가상 PWM 을 그 범위로 바꿔 넘긴다.  데드존과 UP/DN 비대칭은 그 안에서
+    // 처리된다.
+    // 스틱이 데드존을 벗어나 있으면 조종자 값을 쓴다.  스틱을 중앙에 두고
+    // 들어온다는 전제 위에서만 성립한다 (위 [전제] 참고).
+    // CLAW 값에도 THR_DZ 데드밴드가 그대로 걸린다.  롤/피치/요와 같은 이유로
+    // 실기체 파라미터를 넣으면 그대로 재현되게 하기 위해서다.
+    float thr_ctrl;
+    const float pilot_thr = channel_throttle->get_control_in();
+    if (!copter.failsafe.radio &&
+        !is_zero(copter.get_pilot_desired_climb_rate(pilot_thr))) {
+        thr_ctrl = pilot_thr;
+        stick_mask |= (1U << 2);
+    } else {
+        const float mn = channel_throttle->get_radio_min();
+        const float mx = channel_throttle->get_radio_max();
+        thr_ctrl = 1000.0f * (constrain_float(pwm_out[3], mn, mx) - mn) / (mx - mn);
+    }
+    climb_cms = copter.get_pilot_desired_climb_rate(thr_ctrl);
+    climb_cms = constrain_float(climb_cms, -get_pilot_speed_dn(), g.pilot_speed_up);
+}
+
+// ---------------------------------------------------------------------------
+// state 6 (추종 비행) - CLAW 직렬 연결
+//
+// [구조]  두 제어기를 병렬로 돌리지 않는다.  한 줄로 잇는다.
+//
+//     GCS 타겟 -> CLAW -> 스케일 -> LOITER 입력 -> 아두파일럿 제어기 -> 모터
+//
+// 아두파일럿은 GCS 타겟을 더 이상 보지 않는다.  타겟을 아는 것은 CLAW 뿐이고,
+// 아두파일럿은 CLAW 가 주는 "스틱 명령" 만 따른다.  원래 하드웨어(외부컴퓨터가
+// SBUS 로 CLAW 출력을 FC 에 넣던 구성)와 같은 배치다.
+//
+// [기반 모드] LOITER.  ModeLoiter::run() 의 Flying 경로와 같은 함수를 부른다.
+//   loiter_nav->set_pilot_desired_acceleration()   스틱 -> 가속도
+//   loiter_nav->update()                           가속도 적분 -> 속도, XY 제어
+//   pos_control->set_pos_target_z_from_climb_rate_cm()
+//   attitude_control->input_thrust_vector_rate_heading()
+//
+// 그래서 아두파일럿의 PID 스택(속도 PID, 자세 P, 각속도 PID, 수직 3단)과
+// LOIT_SPEED / LOIT_ACC_MAX / ANGLE_MAX 같은 보호가 모두 살아 있다.
+//
+// [state 7 인계]  아두파일럿이 계속 몰고 있었으므로 제어기 상태가 낡지 않는다.
+// 별도의 되맞춤이 필요 없다 (v2 에서 쓰던 reset_target_and_rate 는 뺐다).
 // ---------------------------------------------------------------------------
 
 void ModeTDCN::state_tracking()         // 6 추종 비행
@@ -1532,87 +1645,52 @@ void ModeTDCN::state_tracking()         // 6 추종 비행
     _state_done = true;
 
     if (_state_entered) {
-        // 속도 / 가속 한계 (ModeGuided::pva_control_start() 와 동일)
-        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                           wp_nav->get_wp_acceleration());
-        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                                   wp_nav->get_wp_acceleration());
-        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(),
-                                           wp_nav->get_default_speed_up(),
-                                           wp_nav->get_accel_z());
-        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(),
-                                                  wp_nav->get_default_speed_up(),
-                                                  wp_nav->get_accel_z());
+        // 수직 속도 / 가속 한계.  ModeLoiter::run() 과 같은 값을 쓴다.
+        pos_control->set_max_speed_accel_z(-get_pilot_speed_dn(),
+                                           g.pilot_speed_up, g.pilot_accel_z);
 
-        // 이미 활성인 컨트롤러는 재초기화하지 않는다 (state 5 에서 이어받는다)
-        if (!pos_control->is_active_xy()) {
-            pos_control->init_xy_controller();
-        }
+        // 로이터 목표를 현재 상태에서 시작한다.  init_target() 이 속도
+        // 컨트롤러를 이완시키고 예측 자세를 현재 값으로 맞춘다.
+        loiter_nav->init_target();
+
         if (!pos_control->is_active_z()) {
             pos_control->init_z_controller();
         }
-
-        // 타겟 변환이 실패했을 때 쓸 안전 초기값.  0 으로 두면 EKF origin 으로
-        // 날아가므로, 지금 추종 중인 목표를 넣어 제자리 유지가 되게 한다.
-        _track_pos_neu_cm = pos_control->get_pos_desired_cm();
     }
 
-    // --- CLAW 병렬 실행 -----------------------------------------------------
-    // 기체 제어와 무관하게 매 루프 돌린다.  CLAW 가 받는 입력은 아두파일럿이
-    // 실제로 쓰는 것과 같은 값이므로, 로그를 비교하면 CLAW 를 판정할 수 있다.
-    //
-    //   Update_Info_for_CLAW()  IMU, EKF 속도, 현재 위치, 타겟 위치, 타겟 heading
-    //   CLAW_step()             CLAW 실행
-    //   Log_Write_TDCN()        CLAW_Y.cur_poti (계산 위치) / CLAW_Y.v_cmd (제어값)
+    // --- CLAW 실행 ---
+    // 입력(현재 위치 / 속도 / 자세 / GCS 타겟)은 그대로 넘긴다.  달라진 것은
+    // 출력을 쓰는 방식뿐이다.
     Run_CLAW();
 
-    // --- 기체 제어: 아두파일럿 위치제어로 GCS 타겟 추종 ----------------------
     if (is_disarmed_or_landed()) {
         make_safe_ground_handling();
+        loiter_nav->init_target();
+        // 아래 claw_to_loiter_input() 을 건너뛰므로 스냅샷을 직접 지운다.
+        // 안 그러면 로그에 직전 값이 그대로 살아 있는 것처럼 보인다.
+        _stick_mask = 0;
+        _sim_pwm[0] = _sim_pwm[1] = _sim_pwm[2] = _sim_pwm[3] = 0.0f;
+        _loiter_roll_cd = _loiter_pitch_cd = 0.0f;
+        _loiter_yaw_cds = _loiter_climb_cms = 0.0f;
         return;
     }
 
     motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
 
-    // GCS 타겟 -> EKF origin 기준 NEU cm.
-    // _target_loc 이 int32 위경도 + AltFrame 을 그대로 들고 있으므로 여기서는
-    // 변환만 한다 (부동소수 왕복이 없어 cm 정밀도가 유지된다).
-    Vector3f target_neu_cm;
-    if (_target_loc.get_vector_from_origin_NEU(target_neu_cm)) {
-        _track_pos_neu_cm = target_neu_cm.topostype();
-    }
-    // 변환 실패(EKF origin 미설정)면 마지막 목표를 유지한다
+    // --- CLAW 출력을 LOITER 입력으로 ---
+    claw_to_loiter_input(_loiter_roll_cd, _loiter_pitch_cd,
+                         _loiter_yaw_cds, _loiter_climb_cms,
+                         _stick_mask, _sim_pwm);
 
-    pos_control->input_pos_xyz(_track_pos_neu_cm, 0.0f, 0.0f);
-    pos_control->update_xy_controller();
+    // --- LOITER 파이프라인 (ModeLoiter::run() 의 Flying 경로와 동일) ---
+    loiter_nav->set_pilot_desired_acceleration(_loiter_roll_cd, _loiter_pitch_cd);
+    loiter_nav->update();
+
+    attitude_control->input_thrust_vector_rate_heading(loiter_nav->get_thrust_vector(),
+                                                      _loiter_yaw_cds, false);
+
+    pos_control->set_pos_target_z_from_climb_rate_cm(_loiter_climb_cms);
     pos_control->update_z_controller();
-
-    // 타겟 heading 을 향한다.  CLAW 도 ps_cmd = Ship_heading 을 추종하므로,
-    // 같은 heading 조건이어야 CLAW 의 yaw 채널을 공정하게 비교할 수 있다.
-    auto_yaw.set_yaw_angle_rate(_target_heading_deg, 0.0f);
-
-    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(),
-                                                  auto_yaw.get_heading());
-
-    // --- CLAW 가 모는 동안 아두파일럿 제어기를 현재 상태에 붙여 둔다 ---
-    //
-    // state 7 로 넘어가면 아두파일럿이 기체를 다시 잡는데, 그때 제어기 내부
-    // 상태가 낡아 있으면 인계 순간 자세와 목표가 어긋나 튄다.  CLAW 가 모는
-    // 동안에는 기체가 아두파일럿 명령을 따르지 않으므로 그 어긋남이 계속 커진다.
-    //
-    // 그래서 매 루프 목표를 현재 자세로 되맞추고 적분항을 비운다.  인계 시점에
-    // 이미 목표 = 실제 이므로 state 7 은 "정지점 계산" 만 하면 된다.
-    //
-    // reset_rate 를 false 로 두는 이유는 각속도 제어기를 계속 돌게 두기
-    // 위해서다.  그래야 PID 필터 상태가 살아 있어 되돌아올 때 부드럽다.
-    //
-    // 위 input_thrust_vector_heading() 을 그대로 두는 것은 의도다.  아두파일럿이
-    // "같은 상황에서 무엇을 명령했을지" 가 로그에 남아야 두 제어기를 비교할 수
-    // 있다 (v1 의 목적).  여기서는 그 결과만 기체에 반영되지 않게 덮는다.
-    if (claw_output_active()) {
-        attitude_control->reset_target_and_rate(false);
-        attitude_control->reset_rate_controller_I_terms();
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1868,10 +1868,6 @@ public:
     // CLAW 게인 파라미터.  ParametersG2 가 주소를 잡아야 해서 public 이다.
     CLAW_Gains claw_gains;
 
-    // 믹서 직전 훅.  TDCN_CLAW_ON_OFF 가 1 이면 여기서 아두파일럿이 계산한
-    // 제어값을 CLAW 값으로 갈아끼운다.  Copter::motors_output() 이 부른다.
-    void output_to_motors() override;
-
     // inherit constructors
     using Mode::Mode;
     Number mode_number() const override { return Number::TDCN; }
@@ -2039,17 +2035,6 @@ private:
     float  _in_roll, _in_pitch, _in_yaw;            // rad
     float  _in_ship_hdg;                            // rad, 진북
 
-    // 아두파일럿 rate PID 출력 스냅샷.
-    //
-    // output_to_motors() 가 CLAW 값으로 motors 를 덮어쓰기 전에 잡아둔다.
-    // 로깅은 update_flight_mode() 안에서 일어나는데 그것은 motors_output()
-    // 보다 뒤이므로, 로깅 시점에 motors->get_*() 를 읽으면 CLAW 값이 나온다.
-    // (그러면 인계 중 TDCC 의 MR/MP/MY/MT 가 CLAW 를 자기 자신과 비교하게 된다)
-    float  _ap_roll_out;
-    float  _ap_pitch_out;
-    float  _ap_yaw_out;
-    float  _ap_throttle_out;
-
     // --- 파라미터 ---
     //
     // 소스에 박아 두면 값을 바꿀 때마다 재빌드해야 하고, 실기체에서는 현장에서
@@ -2063,12 +2048,45 @@ private:
     AP_Float _land_alt;         // state 8 착륙 동기 고도 (cm, home 기준 up)
     AP_Float _land_spd;         // state 8 하강 속도 (cm/s)
 
-    // 0 = 아두파일럿이 몰고 CLAW 는 병렬 계산만 (v1)
-    // 1 = CLAW 의 제어값 4개를 믹서에 직접 넣는다 (v2)
-    AP_Int8  _claw_on_off;
+    // --- CLAW 출력 -> 조종기 스틱 등가 스케일 ---
+    //
+    // 원래 하드웨어는  FC <-> 외부컴퓨터 <-> 조종기  가 SBUS 로 묶여 있고
+    // CLAW 가 외부컴퓨터에서 돌았다.  외부컴퓨터가
+    //
+    //     PWM = RCn_TRIM + CLAW출력(-1~+1) x 스케일
+    //
+    // 로 SBUS 를 만들어 FC 에 보내면, FC 는 그것을 평범한 조종기 입력으로 받아
+    // LOITER 로 날았다.  지금 게인은 그 구성에 맞춰져 있으므로, 하드웨어를
+    // 간소화하면서 거동을 유지하려면 FC 안에서 같은 경로를 재현해야 한다.
+    //
+    // 단위는 PWM 오프셋이다 (물리 단위가 아니다).  실제 물리량은 RCn_MIN/
+    // TRIM/MAX, 각 채널 데드존, ANGLE_MAX, PILOT_Y_RATE, PILOT_SPEED_UP/DN,
+    // THR_DZ 를 거쳐 결정된다.
+    AP_Float _sc_roll;          // 기본 250
+    AP_Float _sc_pitch;         // 기본 250
+    AP_Float _sc_yaw;           // 기본  80
+    AP_Float _sc_thr;           // 기본 250
 
-    // CLAW 출력을 믹서에 넣어도 되는 상태인가.  output_to_motors() 가 쓴다.
-    bool claw_output_active() const;
+    // CLAW 출력을 LOITER 가 받을 입력으로 바꾼다.  조종기 스틱이 데드존을
+    // 벗어나 있으면 그 축은 조종자 입력이 이긴다.
+    //   roll_cd/pitch_cd  자세각 (센티도)
+    //   yaw_cds           요 각속도 (센티도/초)
+    //   climb_cms         상승률 (cm/s)
+    //   stick_mask        bit0 롤피치, bit1 요, bit2 스로틀 - 조종자가 잡은 축
+    void claw_to_loiter_input(float &roll_cd, float &pitch_cd,
+                              float &yaw_cds, float &climb_cms,
+                              uint8_t &stick_mask,
+                              float pwm_out[4]);
+
+    // 위 함수가 만든 값의 스냅샷.  로그(TDCK, TDCC.STK)가 쓴다.
+    // state 6 밖에서는 0 이다.
+    uint8_t _stick_mask;
+    float   _sim_pwm[4];        // CLAW 출력에서 만든 가상 스틱 PWM (R,P,Y,T)
+    float   _loiter_roll_cd;    // LOITER 에 넣은 자세각 명령
+    float   _loiter_pitch_cd;
+    float   _loiter_yaw_cds;    // 요 각속도 명령
+    float   _loiter_climb_cms;  // 상승률 명령
+
 };
 #endif
 
