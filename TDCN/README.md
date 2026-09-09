@@ -14,6 +14,21 @@ TDCN/tdcn_log_compare.py                    로그 분석 스크립트
 
 ---
 
+## 버전 변경 요약
+
+| 항목 | v1 | v2 / v3 | **v3-mixed (현재)** |
+|---|---|---|---|
+| CLAW 가 가져가는 축 | 없음 | 롤·피치·요·스로틀 **네 축 전부** | **롤·피치만** |
+| 요 / 스로틀 | 아두파일럿 | CLAW | **아두파일럿** |
+
+CLAW 요 축에서 진동이 있었다. 롤·피치만 CLAW 에 맡겨 그쪽이 멀쩡한지 따로 보려는
+것이 이 갈래다. 그 밖에는 v3 와 같다.
+
+관련 갈래: `tdcn-v3-yb` 는 아예 직렬 구조로, CLAW 출력을 믹서가 아니라 LOITER 의
+스틱 입력 자리에 넣는다.
+
+---
+
 ## v1 → v2 변경 요약
 
 | 항목 | v1 | v2 |
@@ -78,6 +93,24 @@ TDCN/tdcn_log_compare.py                    로그 분석 스크립트
 
 ## 2. CLAW 출력 인계 (`TDCN_CLAW_ON_OFF = 1`)
 
+### 축 분배 — v3-mixed
+
+네 축을 통째로 넘기지 않고 갈라 쓴다.
+
+| 축 | 누가 | 어떻게 |
+|---|---|---|
+| 롤 / 피치 | **CLAW** | `motors->set_roll()` / `set_pitch()` 로 덮어씀 |
+| 요 / 스로틀 | **아두파일럿** | 손대지 않으면 이미 들어 있다 |
+
+요는 `run_rate_controller()` 가, 스로틀은 `pos_control->update_z_controller()`
+-> `set_throttle_out()` 이 넣는다. 덮어쓰지 않는 것으로 충분하다.
+
+피드포워드도 같은 원칙이다. `roll_ff` / `pitch_ff` 만 0 으로 하고 `yaw_ff` 는
+아두파일럿이 쓰는 값이므로 남긴다.
+
+스로틀 환산(`(x+1)/2`) 은 쓰이지 않는다. 스로틀이 아두파일럿 값이기 때문이다.
+아래 "스로틀 환산" 절은 v3 까지의 기록이다.
+
 ### 훅 지점
 
 `Copter` 의 fast loop 는 `run_rate_controller`(7번) 로 제어값을 만들어 `motors` 에
@@ -126,18 +159,53 @@ const float thr = is_negative(ch) ? hover * (1.0f + ch)          // -1 -> 0
 **+0.17 짜리 스로틀 계단**이 주입된다. 실제로 그 상태로 켰을 때 20 m 에서
 고도를 잃었다.
 
-### 인수인계 안전장치
+### 인수인계 안전장치 — v3-mixed 에서 바뀐 것
 
-CLAW 가 모는 동안 아두파일럿 제어기는 자기 명령이 반영되지 않으므로 목표와 실제가
-계속 벌어진다. 그대로 두면 state 7 인계 순간 그 간극만큼 튄다. 그래서 state 6 에서
-CLAW 가 몰 때 매 루프:
+v3 는 CLAW 가 몰 때 매 루프 아래를 불렀다.
 
 ```cpp
-attitude_control->reset_target_and_rate(false);   // 목표 자세 = 현재 자세
+attitude_control->reset_target_and_rate(false);
 attitude_control->reset_rate_controller_I_terms();
 ```
 
-`reset_rate = false` 로 두어 각속도 제어기는 계속 돌게 한다.
+**v3-mixed 에서는 부르지 않는다.** `reset_target_and_rate()` 는 `_attitude_target`
+을 통째로 현재 자세로 끌어당겨 세 축이 한꺼번에 걸린다. 요 목표까지 매 루프 현재
+헤딩으로 덮이면 요 오차가 0 이 되어 아두파일럿 요 출력이 사라지는데, mixed 는
+그 값을 쓰는 구조다.
+
+그리고 이 안전장치는 v3 에서도 실제로는 듣지 않았다. SITL 로그 3 의 state 6 -> 7
+전환 직전:
+
+```
+기체 상태        롤 -1.4 deg, 수평속도 0.04 m/s   (완전 정지)
+아두파일럿 요구  DesRoll -23 deg, 각속도 목표 -100 deg/s
+전환 200 ms 후   롤 -11.8 deg, 수평속도 1.4 m/s
+```
+
+이유가 둘이다.
+
+1. `reset_target_and_rate(false)` 는 `reset_rate = false` 라 `_ang_vel_target` 을
+   지우지 않는다. 자세 목표를 지워도 다음 루프에 `input_thrust_vector_heading()`
+   이 위치 제어기 요구로 다시 덮는다.
+2. 그 위치 제어기의 **속도 PID 적분항이 감겨 있다.** CLAW 가 모는 동안
+   `pos_control` 은 계속 돌지만 출력이 모터에 가지 않아 속도 오차가 닫히지 않는다.
+   `reset_rate_controller_I_terms()` 는 각속도 PID 만 지우므로 이 경로를 못 막는다.
+
+그래서 v3-mixed 는 원인 쪽을 직접 친다.
+
+```cpp
+if (claw_output_active()) {
+    pos_control->relax_velocity_controller_xy();   // 속도 PID 적분항 -> 현재 상태
+    attitude_control->get_rate_roll_pid().reset_I();
+    attitude_control->get_rate_pitch_pid().reset_I();
+}
+```
+
+덮어쓰는 두 축의 각속도 적분항만 지운다. 요 적분항은 실제로 쓰이는 값이라
+건드리지 않는다.
+
+state 7 진입에서는 원래대로 `init_xy_controller_stopping_point()`,
+`reset_rate_controller_I_terms()`, `reset_yaw_target_and_rate()` 를 부른다.
 
 ### 5 → 6 진입 시 요 초기화
 
@@ -198,6 +266,18 @@ state 6 에서만 기록된다. 50 Hz(400 Hz 의 8분주).
 | `TDCA` | 목표 자세 — CLAW `Xtraj[1..3]` vs 아두파일럿 |
 | `TDCR` | 각속도 명령 — CLAW `alpha[1..3]` vs 아두파일럿 |
 | `TDCC` | 제어 출력 — CLAW `v_cmd` vs 믹서 입력, `ACT` 플래그 포함 |
+
+`ACT = 1` 구간에서 **실제로 모터에 간 값**은 축마다 다르다 (v3-mixed).
+
+| 필드 | ACT=1 일 때 |
+|---|---|
+| `CR` / `CP` | 실제로 나간 값 (CLAW) |
+| `MR` / `MP` | 아두파일럿이 냈지만 버려진 값 |
+| `MY` / `MT` | 실제로 나간 값 (아두파일럿) |
+| `CY` / `CH` | CLAW 가 냈지만 버려진 값 |
+
+`tdcn_claw_compare.py` 는 `CY` / `CH` 를 믹서 입력으로 가정하고 그린다. mixed
+로그에서는 그 두 축이 버려진 값이므로 주의한다.
 | `TDCE` | CLAW 내부 — 오차, 적분기, 속도명령, 궤적 |
 
 ### 분석 스크립트
@@ -234,6 +314,9 @@ cd TDCN
 |---|---|
 | 요 진동 | `CLAW_SCALE_Y` 0.13 → 0.03 으로 포화는 사라졌으나 10 Hz 진동이 남아 있다. 실제 자세가 롤 31° / 피치 32° 까지 간다 |
 | 기체 제원 불일치 | CLAW 게인은 실기체 기준이고 SITL 기체는 더 가볍다. `BSC_B_mat` 이 기체 제원에서 나오는 값이라 SITL 로는 게인 적정성·제어 성능 크기를 판정할 수 없다. 실기체 제원으로 SITL 프레임 JSON 을 만들면(`sim_vehicle.py --model json:파일`) 범위가 넓어진다 |
+| **포화 안티와인드업 부재** | `uv_des` 가 `max_vel = 5.0` 에 포화한 동안에도 `TV_BSC[0]/[1]` 이 계속 쌓인다. SITL 로그 3 에서 포화 구간 내내 `BSC_Int_Limit`(±1.0) 에 붙어 있었다. 포화가 풀릴 때 되감기며 오버슈트한다. **CLAW 담당자에게 보고 필요** |
+| **축별 클립 방향 왜곡** | `uv_des` 를 동체 좌표로 회전한 **뒤** 축별로 독립 클립한다. 한 축만 포화하면 속도 명령의 방향이 틀어져 목표가 아닌 쪽으로 민다. **CLAW 담당자에게 보고 필요** |
+| 오차 크기별 출력 변동 | SITL 로그 3: 오차 0~10 m 는 포화 0% / `CR` std 0.049, 20 m 초과는 포화 85% / `CP` std 0.364 로 **7배** 벌어진다. 운용으로는 타겟을 10 m 이하로 준다 |
 | 목표 스텝 크기 | CLAW 는 위치 오차를 shaping 없이 그대로 받는다. `K_POS_P = 0.3`, `max_vel = 5.0` 이므로 **오차 16.7 m 이상이면 속도명령이 포화**한다. state 6 진입 시 선박이 그보다 멀면 진입 순간 포화가 일어난다 |
 
 ---
@@ -247,6 +330,9 @@ cd TDCN
   기본 1). 완전 자동으로 두려면 0 으로 설정한다.
 - **`TDCN_CLAW_ON_OFF = 1` 은 게인이 그 기체에 맞는지 확인한 뒤에만 켠다.**
   이상하면 0 으로 되돌리면 즉시 아두파일럿으로 복귀한다.
+- **타겟은 현재 위치에서 10 m 이내로 준다.** 그보다 크면 CLAW 속도 명령이
+  포화하고 적분기가 감겨 출력이 불안정해진다 (5절 참고). 실제 운용에서 선박은
+  연속으로 움직이므로 문제가 안 되지만, GCS 로 수동 시험할 때는 지켜야 한다.
 
 ---
 

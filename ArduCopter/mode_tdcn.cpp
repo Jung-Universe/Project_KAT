@@ -1130,19 +1130,23 @@ void ModeTDCN::output_to_motors()
     _ap_yaw_out      = motors->get_yaw()   + motors->get_yaw_ff();
     _ap_throttle_out = attitude_control->get_throttle_in();
 
+    // [mixed]  네 축을 통째로 넘기지 않고 갈라서 쓴다.
+    //
+    //     롤 / 피치   CLAW
+    //     요 / 스로틀  아두파일럿
+    //
+    // 요 축이 CLAW 에서 진동했기 때문에, 롤/피치만 CLAW 에 맡겨서 그쪽이
+    // 멀쩡한지 따로 보려는 것이다.  요와 스로틀은 손대지 않으면 이미
+    // 아두파일럿 값이 들어 있다.  요는 run_rate_controller() 가, 스로틀은
+    // pos_control->update_z_controller() -> set_throttle_out() 이 넣는다.
     if (claw_output_active()) {
         motors->set_roll(constrain_float(CLAW_Y.v_cmd.cmd_roll,  -1.0f, 1.0f));
         motors->set_pitch(constrain_float(CLAW_Y.v_cmd.cmd_pitch, -1.0f, 1.0f));
-        motors->set_yaw(constrain_float(CLAW_Y.v_cmd.cmd_yaw,   -1.0f, 1.0f));
 
-        // 범위만 맞춘다: -1 ~ +1  ->  0 ~ 1  (호버 보정 없음, 위 주석 참조)
-        const float ch = constrain_float(CLAW_Y.v_cmd.cmd_height, -1.0f, 1.0f);
-        motors->set_throttle(constrain_float((ch + 1.0f) * 0.5f, 0.0f, 1.0f));
-
-        // 아두파일럿 각속도 PID 의 피드포워드가 더해지지 않게 지운다
+        // 덮어쓴 두 축의 피드포워드만 지운다.  요 피드포워드는 아두파일럿이
+        // 쓰는 값이므로 그대로 둔다.
         motors->set_roll_ff(0.0f);
         motors->set_pitch_ff(0.0f);
-        motors->set_yaw_ff(0.0f);
     }
 
     Mode::output_to_motors();
@@ -1609,9 +1613,35 @@ void ModeTDCN::state_tracking()         // 6 추종 비행
     // 위 input_thrust_vector_heading() 을 그대로 두는 것은 의도다.  아두파일럿이
     // "같은 상황에서 무엇을 명령했을지" 가 로그에 남아야 두 제어기를 비교할 수
     // 있다 (v1 의 목적).  여기서는 그 결과만 기체에 반영되지 않게 덮는다.
+    // [mixed]  reset_target_and_rate() 를 부르지 않는다.
+    //
+    // 그 함수는 목표 자세를 현재 자세로 끌어당기는데, 세 축을 한꺼번에
+    // 건드린다 (_attitude_target 통째로).  요 목표까지 매 루프 현재 헤딩으로
+    // 덮이면 요 오차가 0 이 되어 아두파일럿 요 출력이 사라진다.  mixed 는
+    // 그 값을 쓰는 구조이므로 부르면 안 된다.
+    //
+    // 대신 덮어쓰는 두 축의 적분항만 지운다.  롤/피치는 아두파일럿 명령이
+    // 모터에 안 가는데 자세 오차는 계속 쌓이므로, 그대로 두면 적분기가
+    // 감기고 state 7 인계 때 그만큼 튄다.  요 적분항은 실제로 쓰이는
+    // 값이라 건드리지 않는다.
     if (claw_output_active()) {
-        attitude_control->reset_target_and_rate(false);
-        attitude_control->reset_rate_controller_I_terms();
+        // 위치 제어기의 속도 PID 적분항을 현재 상태로 맞춘다.
+        //
+        // CLAW 가 롤/피치를 모는 동안에도 pos_control 은 GCS 타겟을 향해 계속
+        // 돌지만 그 출력은 모터에 가지 않는다.  그래서 속도 오차가 닫히지
+        // 않고 적분항이 감기며, 그 결과가 자세 목표로 나온다.  로그 3 에서
+        // 기체가 수평(롤 -1.4도)으로 정지해 있는데 DesRoll 은 -23도,
+        // 각속도 목표는 -100 deg/s 였다.  state 7 로 넘어가 아두파일럿이
+        // 모터를 되찾는 순간 그 명령이 그대로 나가 200 ms 만에 롤 -11.8도로
+        // 튀었다.
+        //
+        // reset_rate_controller_I_terms() 는 각속도 PID 만 지우므로 이 경로를
+        // 막지 못한다.  위치 제어기 쪽을 직접 쳐야 한다.
+        pos_control->relax_velocity_controller_xy();
+
+        // 덮어쓰는 두 축의 각속도 적분항.  요는 아두파일럿이 쓰므로 제외.
+        attitude_control->get_rate_roll_pid().reset_I();
+        attitude_control->get_rate_pitch_pid().reset_I();
     }
 }
 
