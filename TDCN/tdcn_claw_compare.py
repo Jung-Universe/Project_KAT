@@ -33,8 +33,6 @@ import numpy as np
 A_C, B_C = "#1f77b4", "#ff7f0e"
 
 LOG_DIRS = (
-    "logs",
-    "../logs",
     os.path.expanduser("~/Desktop/KAT/ardupilot/logs"),
 )
 
