@@ -96,20 +96,20 @@ traj_NE = [
     (+30.0,   0.0),     
     (  0.0, +30.0),     
     (-30.0,   0.0),    
-    (  0.0, -30.0),     
+    (  0.0, -20.0),     
 ]
 
 #: 고도 오프셋 (m).  궤적 내내 일정하다.
 traj_U = 15.0
 
 #: 배의 속도 (m/s).  웨이포인트 사이를 이 속도로 지난다.
-SHIP_SPEED_MPS = 1.0
+SHIP_SPEED_MPS = 5.0
 
 #: 배가 자기 상태(위치/헤딩)를 갱신하는 주기 (Hz).  궤적 해상도.
 SHIP_UPDATE_RATE_HZ = 400.0
 
 #: 텔레메트리로 FC 에 타겟을 보내는 주기 (Hz).
-TELEM_SEND_RATE_HZ = 50.0
+TELEM_SEND_RATE_HZ = 10.0
 
 #: 배의 출발 위치 (m, home 기준)
 SHIP_START_NORTH = 0.0
