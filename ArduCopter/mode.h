@@ -1854,6 +1854,15 @@ public:
     void apply(void) const;
 
 private:
+    // 기본값 (mode_tdcn_CLAW_data_0729.c 의 CLAW_P 초기값).  생성자에서 채우고
+    // var_info 가 AP_GROUPINFO_FLAGS_DEFAULT_POINTER 로 가리킨다.
+    const float _def_scale_th, _def_scale_r, _def_scale_p, _def_scale_y;
+    const float _def_k_pos_p, _def_k_pos_i, _def_k_vel_p, _def_k_vel_i;
+    const float _def_awu_limit;
+    const float _def_ome_xx, _def_ome_yy, _def_ome_zz, _def_ome_ph, _def_ome_th, _def_ome_ps;
+    const float _def_zeta_xx, _def_zeta_yy, _def_zeta_zz, _def_zeta_ph, _def_zeta_th, _def_zeta_ps;
+    const float _def_tau_hdot, _def_tau_r;
+
     AP_Float _scale_th, _scale_r, _scale_p, _scale_y;
     AP_Float _k_pos_p, _k_pos_i, _k_vel_p, _k_vel_i;
     AP_Float _awu_limit;

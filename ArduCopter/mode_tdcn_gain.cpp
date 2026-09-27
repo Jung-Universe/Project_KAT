@@ -7,6 +7,10 @@
 // ===========================================================================
 // Part 2. 게인 (CLAW_*)    GCS 에서 수정 / apply() 가 CLAW_P 로 복사
 //
+// 기본값은 mode_tdcn_CLAW_data_0729.c 의 CLAW_P 초기값을 그대로 쓴다.  데이터 파일을
+// 고치고 빌드하면 그 값이 곧 CLAW_* 기본값이다 (표의 기본값은 _def_* 를 가리킨다).
+// 단, 기체에 CLAW_* 값이 저장돼 있으면 (GCS 에서 바꾼 적이 있으면) 저장값이 우선한다.
+//
 // AP_GROUPINFO 의 번호는 기체에 저장된 값을 찾는 키다.  순서를 옮기거나 번호를
 // 다시 매기면 저장값과 어긋나므로, 새 항목은 빈 번호를 뒤에 붙인다.
 // ===========================================================================
@@ -20,63 +24,63 @@ const AP_Param::GroupInfo CLAW_Gains::var_info[] = {
     // @Description: Scales the backstepping thrust output into the normalised command range
     // @Range: 0.1 10
     // @User: Advanced
-    AP_GROUPINFO("SCALE_TH", 1, CLAW_Gains, _scale_th, 3.2),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("SCALE_TH", 1, CLAW_Gains, _scale_th, _def_scale_th),
 
     // @Param: SCALE_R
     // @DisplayName: CLAW roll output scale
     // @Description: Scales the backstepping roll output into the normalised command range
     // @Range: 0.01 2
     // @User: Advanced
-    AP_GROUPINFO("SCALE_R", 2, CLAW_Gains, _scale_r, 0.25),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("SCALE_R", 2, CLAW_Gains, _scale_r, _def_scale_r),
 
     // @Param: SCALE_P
     // @DisplayName: CLAW pitch output scale
     // @Description: Scales the backstepping pitch output into the normalised command range
     // @Range: 0.01 2
     // @User: Advanced
-    AP_GROUPINFO("SCALE_P", 3, CLAW_Gains, _scale_p, 0.20),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("SCALE_P", 3, CLAW_Gains, _scale_p, _def_scale_p),
 
     // @Param: SCALE_Y
     // @DisplayName: CLAW yaw output scale
     // @Description: Scales the backstepping yaw output into the normalised command range
     // @Range: 0.01 2
     // @User: Advanced
-    AP_GROUPINFO("SCALE_Y", 4, CLAW_Gains, _scale_y, 0.13),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("SCALE_Y", 4, CLAW_Gains, _scale_y, _def_scale_y),
 
     // @Param: K_POS_P
     // @DisplayName: CLAW outer loop position P
     // @Description: Position error to velocity command gain
     // @Range: 0 2
     // @User: Advanced
-    AP_GROUPINFO("K_POS_P", 5, CLAW_Gains, _k_pos_p, 0.3),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("K_POS_P", 5, CLAW_Gains, _k_pos_p, _def_k_pos_p),
 
     // @Param: K_POS_I
     // @DisplayName: CLAW outer loop position I
     // @Description: Position error integral gain
     // @Range: 0 1
     // @User: Advanced
-    AP_GROUPINFO("K_POS_I", 6, CLAW_Gains, _k_pos_i, 0.01),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("K_POS_I", 6, CLAW_Gains, _k_pos_i, _def_k_pos_i),
 
     // @Param: K_VEL_P
     // @DisplayName: CLAW outer loop velocity P
     // @Description: Velocity error to attitude command gain
     // @Range: 0 2
     // @User: Advanced
-    AP_GROUPINFO("K_VEL_P", 7, CLAW_Gains, _k_vel_p, 0.4),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("K_VEL_P", 7, CLAW_Gains, _k_vel_p, _def_k_vel_p),
 
     // @Param: K_VEL_I
     // @DisplayName: CLAW outer loop velocity I
     // @Description: Velocity error integral gain
     // @Range: 0 1
     // @User: Advanced
-    AP_GROUPINFO("K_VEL_I", 8, CLAW_Gains, _k_vel_i, 0.05),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("K_VEL_I", 8, CLAW_Gains, _k_vel_i, _def_k_vel_i),
 
     // @Param: AWU_LIMIT
     // @DisplayName: CLAW integrator limit
     // @Description: Anti windup clamp applied to all four CLAW integrators
     // @Range: 0.1 10
     // @User: Advanced
-    AP_GROUPINFO("AWU_LIMIT", 9, CLAW_Gains, _awu_limit, 1.0),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("AWU_LIMIT", 9, CLAW_Gains, _awu_limit, _def_awu_limit),
 
     // @Param: OMEGA_XX
     // @DisplayName: CLAW trajectory natural frequency North
@@ -84,7 +88,7 @@ const AP_Param::GroupInfo CLAW_Gains::var_info[] = {
     // @Units: rad/s
     // @Range: 0.05 20
     // @User: Advanced
-    AP_GROUPINFO("OMEGA_XX", 10, CLAW_Gains, _ome_xx, 0.3),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("OMEGA_XX", 10, CLAW_Gains, _ome_xx, _def_ome_xx),
 
     // @Param: OMEGA_YY
     // @DisplayName: CLAW trajectory natural frequency East
@@ -92,7 +96,7 @@ const AP_Param::GroupInfo CLAW_Gains::var_info[] = {
     // @Units: rad/s
     // @Range: 0.05 20
     // @User: Advanced
-    AP_GROUPINFO("OMEGA_YY", 11, CLAW_Gains, _ome_yy, 0.3),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("OMEGA_YY", 11, CLAW_Gains, _ome_yy, _def_ome_yy),
 
     // @Param: OMEGA_ZZ
     // @DisplayName: CLAW trajectory natural frequency height
@@ -100,7 +104,7 @@ const AP_Param::GroupInfo CLAW_Gains::var_info[] = {
     // @Units: rad/s
     // @Range: 0.05 20
     // @User: Advanced
-    AP_GROUPINFO("OMEGA_ZZ", 12, CLAW_Gains, _ome_zz, 2.0),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("OMEGA_ZZ", 12, CLAW_Gains, _ome_zz, _def_ome_zz),
 
     // @Param: OMEGA_PH
     // @DisplayName: CLAW trajectory natural frequency roll
@@ -108,7 +112,7 @@ const AP_Param::GroupInfo CLAW_Gains::var_info[] = {
     // @Units: rad/s
     // @Range: 0.05 30
     // @User: Advanced
-    AP_GROUPINFO("OMEGA_PH", 13, CLAW_Gains, _ome_ph, 9.3),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("OMEGA_PH", 13, CLAW_Gains, _ome_ph, _def_ome_ph),
 
     // @Param: OMEGA_TH
     // @DisplayName: CLAW trajectory natural frequency pitch
@@ -116,7 +120,7 @@ const AP_Param::GroupInfo CLAW_Gains::var_info[] = {
     // @Units: rad/s
     // @Range: 0.05 30
     // @User: Advanced
-    AP_GROUPINFO("OMEGA_TH", 14, CLAW_Gains, _ome_th, 12.0),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("OMEGA_TH", 14, CLAW_Gains, _ome_th, _def_ome_th),
 
     // @Param: OMEGA_PS
     // @DisplayName: CLAW trajectory natural frequency yaw
@@ -124,49 +128,49 @@ const AP_Param::GroupInfo CLAW_Gains::var_info[] = {
     // @Units: rad/s
     // @Range: 0.05 30
     // @User: Advanced
-    AP_GROUPINFO("OMEGA_PS", 15, CLAW_Gains, _ome_ps, 3.0),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("OMEGA_PS", 15, CLAW_Gains, _ome_ps, _def_ome_ps),
 
     // @Param: ZETA_XX
     // @DisplayName: CLAW trajectory damping North
     // @Description: Damping ratio of the North axis trajectory filter
     // @Range: 0.1 2
     // @User: Advanced
-    AP_GROUPINFO("ZETA_XX", 16, CLAW_Gains, _zeta_xx, 1.015),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("ZETA_XX", 16, CLAW_Gains, _zeta_xx, _def_zeta_xx),
 
     // @Param: ZETA_YY
     // @DisplayName: CLAW trajectory damping East
     // @Description: Damping ratio of the East axis trajectory filter
     // @Range: 0.1 2
     // @User: Advanced
-    AP_GROUPINFO("ZETA_YY", 17, CLAW_Gains, _zeta_yy, 1.015),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("ZETA_YY", 17, CLAW_Gains, _zeta_yy, _def_zeta_yy),
 
     // @Param: ZETA_ZZ
     // @DisplayName: CLAW trajectory damping height
     // @Description: Damping ratio of the height trajectory filter
     // @Range: 0.1 2
     // @User: Advanced
-    AP_GROUPINFO("ZETA_ZZ", 18, CLAW_Gains, _zeta_zz, 0.75),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("ZETA_ZZ", 18, CLAW_Gains, _zeta_zz, _def_zeta_zz),
 
     // @Param: ZETA_PH
     // @DisplayName: CLAW trajectory damping roll
     // @Description: Damping ratio of the roll trajectory filter
     // @Range: 0.1 2
     // @User: Advanced
-    AP_GROUPINFO("ZETA_PH", 19, CLAW_Gains, _zeta_ph, 0.98),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("ZETA_PH", 19, CLAW_Gains, _zeta_ph, _def_zeta_ph),
 
     // @Param: ZETA_TH
     // @DisplayName: CLAW trajectory damping pitch
     // @Description: Damping ratio of the pitch trajectory filter
     // @Range: 0.1 2
     // @User: Advanced
-    AP_GROUPINFO("ZETA_TH", 20, CLAW_Gains, _zeta_th, 0.98),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("ZETA_TH", 20, CLAW_Gains, _zeta_th, _def_zeta_th),
 
     // @Param: ZETA_PS
     // @DisplayName: CLAW trajectory damping yaw
     // @Description: Damping ratio of the yaw trajectory filter
     // @Range: 0.1 2
     // @User: Advanced
-    AP_GROUPINFO("ZETA_PS", 21, CLAW_Gains, _zeta_ps, 0.9),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("ZETA_PS", 21, CLAW_Gains, _zeta_ps, _def_zeta_ps),
 
     // @Param: TAU_HDOT
     // @DisplayName: CLAW climb rate time constant
@@ -174,7 +178,7 @@ const AP_Param::GroupInfo CLAW_Gains::var_info[] = {
     // @Units: s
     // @Range: 0.01 2
     // @User: Advanced
-    AP_GROUPINFO("TAU_HDOT", 22, CLAW_Gains, _tau_hdot, 0.164297),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("TAU_HDOT", 22, CLAW_Gains, _tau_hdot, _def_tau_hdot),
 
     // @Param: TAU_R
     // @DisplayName: CLAW yaw rate time constant
@@ -182,13 +186,41 @@ const AP_Param::GroupInfo CLAW_Gains::var_info[] = {
     // @Units: s
     // @Range: 0.01 2
     // @User: Advanced
-    AP_GROUPINFO("TAU_R", 23, CLAW_Gains, _tau_r, 0.150985),
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("TAU_R", 23, CLAW_Gains, _tau_r, _def_tau_r),
 
     AP_GROUPEND
 };
 // ---------------------------------------------------------------------------
 
-CLAW_Gains::CLAW_Gains(void)
+// 기본값 = mode_tdcn_CLAW_data_0729.c 의 CLAW_P 초기값.
+//
+// CLAW_P 는 상수로만 초기화되는 C 전역이라 이 생성자보다 먼저 값이 들어 있다
+// (정적 초기화).  여기서 복사해 두므로, 비행 중 apply() 가 CLAW_P 를 덮어써도
+// 기본값은 데이터 파일 값 그대로다.
+CLAW_Gains::CLAW_Gains(void) :
+    _def_scale_th((float)CLAW_P.BSC_Scale_Thrust),
+    _def_scale_r((float)CLAW_P.BSC_Scale_Roll),
+    _def_scale_p((float)CLAW_P.BSC_Scale_Pitch),
+    _def_scale_y((float)CLAW_P.BSC_Scale_Yaw),
+    _def_k_pos_p((float)CLAW_P.BSC_K_POS_P),
+    _def_k_pos_i((float)CLAW_P.BSC_K_POS_I),
+    _def_k_vel_p((float)CLAW_P.BSC_K_VEL_P),
+    _def_k_vel_i((float)CLAW_P.BSC_K_VEL_I),
+    _def_awu_limit((float)CLAW_P.BSC_Int_Limit),
+    _def_ome_xx((float)CLAW_P.BSC_Ome_XX),
+    _def_ome_yy((float)CLAW_P.BSC_Ome_YY),
+    _def_ome_zz((float)CLAW_P.BSC_Ome_ZZ),
+    _def_ome_ph((float)CLAW_P.BSC_Ome_PH),
+    _def_ome_th((float)CLAW_P.BSC_Ome_TH),
+    _def_ome_ps((float)CLAW_P.BSC_Ome_PS),
+    _def_zeta_xx((float)CLAW_P.BSC_Zeta_XX),
+    _def_zeta_yy((float)CLAW_P.BSC_Zeta_YY),
+    _def_zeta_zz((float)CLAW_P.BSC_Zeta_ZZ),
+    _def_zeta_ph((float)CLAW_P.BSC_Zeta_PH),
+    _def_zeta_th((float)CLAW_P.BSC_Zeta_TH),
+    _def_zeta_ps((float)CLAW_P.BSC_Zeta_PS),
+    _def_tau_hdot((float)CLAW_P.BSC_Tau_hdot),
+    _def_tau_r((float)CLAW_P.BSC_Tau_r)
 {
     AP_Param::setup_object_defaults(this, var_info);
 }

@@ -26,7 +26,7 @@ P_CLAW_T CLAW_P = {
     0.1,  /* BSC_Scale_Thrust */
     0.1,   /* BSC_Scale_Roll   */
     0.1,   /* BSC_Scale_Pitch  */
-    0.2,   /* BSC_Scale_Yaw    */
+    0.1,   /* BSC_Scale_Yaw    */
 
     /* --- [�߰�] Outer Loop Gains --- */
     0.5,  /* BSC_K_POS_P : ��ġ ��� ���� */
