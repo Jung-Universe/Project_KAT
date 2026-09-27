@@ -16,41 +16,42 @@
  * Code generation objectives: Unspecified
  * Validation result: Not run
  */
-/* --- ERR_E Direction 4~5m/s --- */
+
 #include "mode_tdcn_CLAW.h"
 
 P_CLAW_T CLAW_P = {
     /* --- [1] Scaling Factors --- */
-    /* Controller_Var.c           Scale                  (            ) */
-    /*  ʿ     Rotor_PWM_max           Ͽ        ʿ  */
-    3.2,  /* BSC_Scale_Thrust */
-    0.25,   /* BSC_Scale_Roll   */
-    0.20,   /* BSC_Scale_Pitch  */
-    0.13,   /* BSC_Scale_Yaw    */
+    /* Controller_Var.c Scale ( ) */
+    /*ʿ  Rotor_PWM_maxϿʿ */
+    0.1,  /* BSC_Scale_Thrust */
+    0.1,   /* BSC_Scale_Roll   */
+    0.1,   /* BSC_Scale_Pitch  */
+    0.2,   /* BSC_Scale_Yaw    */
 
-    /* --- [ ߰ ] Outer Loop Gains --- */
-    0.3,  /* BSC_K_POS_P :   ġ          */
-    0.01,  /* BSC_K_POS_I :   ġ           */
-    0.4,  /* BSC_K_VEL_P :  ӵ           */
-    0.05,  /* BSC_K_VEL_I :  ӵ            */
-    /* [ ߰ ] Anti-Windup Limit */
-    1.0,   /*    б          Ѱ  (  : 5.0m/s             ) */
+    /* --- [�߰�] Outer Loop Gains --- */
+    0.5,  /* BSC_K_POS_P : ��ġ ��� ���� */
+    0.1,  /* BSC_K_POS_I : ��ġ ���� ���� */
+    0.3,  /* BSC_K_VEL_P : �ӵ� ��� ���� */
+    0.13,  /* BSC_K_VEL_I : �ӵ� ���� ���� */
+
+    /* [�߰�] Anti-Windup Limit */
+    2.0,   /* ���б� ���� ���Ѱ� (��: 2.0m/s ������ �����) */
 
     /* --- [2] BSC Control Gains (From Controller_Var.c) --- */
     /* Omega */
-    0.3,   /* BSC_Ome_XX        2026.04.28 0.5 수정*/
-    0.3,   /* BSC_Ome_YY        2026.04.28 0.5 수정*/
+    0.3,   /* BSC_Ome_XX */
+    0.3,   /* BSC_Ome_YY */
     2.0,   /* BSC_Ome_ZZ */
-    9.3,  /* BSC_Ome_PH */
-    12.0,  /* BSC_Ome_TH */
+    10.0,  /* BSC_Ome_PH */
+    10.0,  /* BSC_Ome_TH */
     3.0,  /* BSC_Ome_PS */
 
     /* Zeta */
-    1.015,  /* BSC_Zeta_XX       2026.04.28 0.95 무조건 1근처로 */
-    1.015,   /* BSC_Zeta_YY       2026.04.28 0.95 무조건 1근처로 */
+    1.015,  /* BSC_Zeta_XX */
+    1.015,  /* BSC_Zeta_YY */
     0.75,  /* BSC_Zeta_ZZ */
-    0.98,  /* BSC_Zeta_PH */
-    0.98,  /* BSC_Zeta_TH */
+    0.75,  /* BSC_Zeta_PH */
+    0.75,  /* BSC_Zeta_TH */
     0.9,  /* BSC_Zeta_PS */
 
     /* Time Constants */
@@ -87,49 +88,49 @@ P_CLAW_T CLAW_P = {
 // P_CLAW_T CLAW_P = {
 //   /* Variable: Kd_height   */
 //   0.0,
-//
+// 
 //   /* Variable: Kd_pitch   */
 //   0.06,
-//
+// 
 //   /* Variable: Kd_roll   */
 //   0.06,
-//
+// 
 //   /* Variable: Kd_yaw   */
 //   0.0,
-//
+// 
 //   /* Variable: Ki_height   */
 //   0.0,
-//
+// 
 //   /* Variable: Ki_pitch   */
 //   0.0,
-//
+// 
 //   /* Variable: Ki_roll   */
 //   0.0,
-//
+// 
 //   /* Variable: Ki_yaw   */
 //   0.0,
-//
+// 
 //   /* Variable: Kp_height   */
 //   0.0,
-//
+// 
 //   /* Variable: Kp_pitch   */
 //   0.1,
-//
+// 
 //   /* Variable: Kp_roll   */
 //   0.1,
-//
+// 
 //   /* Variable: Kp_yaw   */
 //   0.0,
-//
+// 
 //   /* Variable: height_scale   */
 //   1.0,
-//
+// 
 //   /* Variable: pitch_scale   */
 //   1.0,
-//
+// 
 //   /* Variable: roll_scale   */
 //   1.0,
-//
+// 
 //   /* Variable: yaw_scale   */
 //   1.0
 // };

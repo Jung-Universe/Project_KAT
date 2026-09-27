@@ -1831,7 +1831,9 @@ private:
 // TDCN integrates the externally supplied CLAW controller
 // (mode_tdcn_CLAW_IBSC_ship_Fianl_NED.c).  Version 1 only monitors CLAW - its
 // control output is not applied to the vehicle.  Implementation: mode_tdcn.cpp
-// CLAW 제어기 게인.
+// (parameters: mode_tdcn_param.cpp, CLAW gains: mode_tdcn_gain.cpp)
+//
+// CLAW 제어기 게인.  정의는 mode_tdcn_gain.cpp (Part 2).
 //
 // 원래 mode_tdcn_CLAW_data_0729.c 에 상수로 박혀 있어 값을 바꾸려면 재빌드가
 // 필요했다.  파라미터로 빼서 미션플래너에서 CLAW_ 로 검색 / 조정할 수 있게 한다.
@@ -1865,7 +1867,13 @@ class ModeTDCN : public Mode {
 public:
     ModeTDCN(void);
 
-    // CLAW 게인 파라미터.  ParametersG2 가 주소를 잡아야 해서 public 이다.
+    // Part 1. 파라미터 테이블 (mode_tdcn_param.cpp).  ParametersG2 에 TDCN_
+    // 접두사로 등록되어 미션플래너 파라미터 목록에서 검색 / 변경할 수 있다
+    // (Parameters.cpp 의 var_info2).
+    static const struct AP_Param::GroupInfo var_info[];
+
+    // Part 2. CLAW 게인 파라미터 (mode_tdcn_gain.cpp).  ParametersG2 가 주소를
+    // 잡아야 해서 public 이다.
     CLAW_Gains claw_gains;
 
     // 믹서 직전 훅.  TDCN_CLAW_ON_OFF 가 1 이면 여기서 아두파일럿이 계산한
@@ -1875,10 +1883,6 @@ public:
     // inherit constructors
     using Mode::Mode;
     Number mode_number() const override { return Number::TDCN; }
-
-    // 파라미터 테이블.  ParametersG2 에 TDCN_ 접두사로 등록되어 미션플래너
-    // 파라미터 목록에서 검색 / 변경할 수 있다 (Parameters.cpp 의 var_info2).
-    static const struct AP_Param::GroupInfo var_info[];
 
     // 시나리오 상태 - GCS 가 MAV_CMD_USER_1 param1 으로 보낸다
     enum class State : uint8_t {
@@ -1894,6 +1898,11 @@ public:
         LANDING_STOW  = 9,  // 착륙 수납
         DISARMED      = 10, // DISARMED
         HANGAR_CLOSE  = 11, // 격납함 닫기
+
+        // 자동 진행.  각 단계의 state 함수를 차례로 부르며, 끝 단계에 닿으면
+        // 그 state (6 / 11) 로 넘어가 일반 처리를 이어간다.
+        AUTO_TO_TRACKING = 12, // 1~6 자동 진행 (6 의 초기 목표 = 현재 위치)
+        AUTO_TO_CLOSE    = 13, // 6~11 자동 진행
     };
 
     bool init(bool ignore_checks) override;
@@ -1914,11 +1923,14 @@ public:
     bool is_taking_off() const override;
     bool is_landing() const override;
 
-    // MAV_CMD_USER_1 수신 + 파싱.  GCS_Mavlink.cpp 가 호출한다.
+    // MAV_CMD_USER_1 수신.  GCS_Mavlink.cpp 가 호출한다.
     //
-    // GCS::update_receive 는 메인 스레드 스케줄러 태스크이므로 run() 과 같은
-    // 스레드에서 돈다.  따라서 수신값을 따로 보관해 두고 run() 에서 꺼내 쓸
-    // 필요가 없고, 여기서 바로 파싱해도 안전하다 (락 불필요).
+    // ACK 는 ACCEPTED / DENIED 두 가지뿐이다.  DENIED = 입력 거부 (기체는 하던
+    // 일을 계속한다): TDCN 모드 아님, 순서 위반, 현재 단계 미완료, 값 오류.
+    // 통과한 명령은 _gcs_cmd 에 보관만 한다.
+    // state 전이 / 타겟 반영은 run() 의 check_gcs_message() 가 한다.
+    // GCS::update_receive 는 메인 스레드 스케줄러 태스크라 run() 과 같은
+    // 스레드에서 돌므로 보관함에 락은 필요 없다.
     MAV_RESULT GCS_command(const mavlink_command_int_t &packet);
 
     // state 번호에 대응하는 이름 (로그/GCS 메시지용)
@@ -1930,19 +1942,27 @@ protected:
 
 private:
 
+    // 기체 상태 점검 (무장 시각 추적).  run() 맨 앞에서 매 루프 부른다.
+    void check_vehicle_status();
+
+    // GCS 메시지 점검.  GCS_command() 가 보관한 명령을 꺼내 state 전이 /
+    // 타겟을 반영한다.  run() 에서 check_vehicle_status() 다음에 부른다.
+    void check_gcs_message();
+
+    // 현재 상태 업데이트.  run() 에서 state 별 처리 다음에 부른다.
+    // 목표값 / 현재값 / 제어값을 _status 에 저장한다.
+    void update_status();
+
     // run() 2단계 - CLAW_U 에 기체 정보를 전달한다
     void Update_Info_for_CLAW();
 
-    // CLAW 한 스텝 (home 갱신 -> 입력 전달 -> CLAW_step -> 출력 로깅).
+    // CLAW 한 스텝 (게인 반영 -> 입력 전달 -> CLAW_step).
     // CLAW 를 돌려야 하는 state_*() 에서 호출한다.
     void Run_CLAW();
 
     // state 순서 가드.  GCS 가 순서를 건너뛰거나 현재 단계가 끝나기 전에
     // 다음 번호를 보내는 것을 막는다.
     static bool state_order_ok(State from, State to);   // 번호 순서가 맞는가
-
-    // CLAW 출력 모니터링.  CLAW_step() 직후에 호출한다.
-    void Log_Write_TDCN();
 
     void state_hangar_open();       // 1
     void state_takeoff_wait();      // 2
@@ -1983,7 +2003,7 @@ private:
     // 1Hz 재시도를 기다리지 않고 곧바로 다시 무장하기 위한 것이다.
     bool _was_armed;
 
-    // 무장이 걸린 시각.  run() 이 매 루프 해제->무장 엣지를 잡아 갱신한다.
+    // 무장이 걸린 시각.  check_vehicle_status() 가 매 루프 해제->무장 엣지를 잡아 갱신한다.
     // state 4 가 "무장한 지 얼마나 됐는가" 로 이륙 시작 시점을 미루는 데 쓴다.
     // (_was_armed 는 state 3 전용이라 따로 둔다)
     uint32_t _armed_ms;
@@ -2000,8 +2020,6 @@ private:
 
     // 위 처리에서 잡을 위치를 이미 정했는가.  지상으로 내려오면 다시 내린다.
     bool _air_hold_valid;
-
-    uint16_t _log_counter;          // 로그 데시메이션 카운터
 
     // state 2 - 마지막으로 GCS 에 알린 pre-arm 결과.  400Hz 로 같은 내용을
     // 반복해 보내지 않기 위해 결과가 바뀔 때만 알린다.
@@ -2024,33 +2042,77 @@ private:
     Location _target_loc;
     float    _target_heading_deg;   // 진북 기준 (deg)
 
-    // CLAW_step() 직전에 떠 두는 입력 스냅샷.
-    //
-    // "TDCN 이 넘긴 값" 과 "CLAW 가 내부에서 인식한 값" 을 비교하려면 넘긴 쪽을
-    // 그대로 들고 있어야 한다.  CLAW 는 home 래치 스텝에서 Dest_poti_i 를 현재
-    // 위치로 스스로 덮어쓰므로, CLAW_step() 뒤에 읽으면 넘긴 값이 아니게 된다.
-    //
-    // 고도는 넘길 때의 기준(up 양수) 그대로 담는다.  CLAW 는 안에서 down 으로
-    // 뒤집으므로, 로그로 남길 때 이쪽을 뒤집어 맞춘다.
-    double _in_cur_lat, _in_cur_lng, _in_cur_alt;   // deg, deg, m(up)
-    double _in_dst_lat, _in_dst_lng, _in_dst_alt;   // deg, deg, m(up)
-    double _in_vel_n, _in_vel_e, _in_vel_d;         // m/s, NED
-    float  _in_p, _in_q, _in_r;                     // rad/s, body FRD
-    float  _in_roll, _in_pitch, _in_yaw;            // rad
-    float  _in_ship_hdg;                            // rad, 진북
+    // GCS 명령 보관함.  GCS_command() 가 검사를 통과한 명령을 넣고,
+    // check_gcs_message() 가 꺼내 반영한다.  같은 루프 사이에 여러 개가 오면
+    // 마지막 것만 남는다 (state 6 타겟은 최신 값이 맞다).
+    struct {
+        bool     pending;               // 반영 대기 중인 명령이 있는가
+        State    state;
+        Location target_loc;            // state 6 에서만 유효
+        float    target_heading_deg;    // state 6 에서만 유효
 
-    // 아두파일럿 rate PID 출력 스냅샷.
-    //
-    // output_to_motors() 가 CLAW 값으로 motors 를 덮어쓰기 전에 잡아둔다.
-    // 로깅은 update_flight_mode() 안에서 일어나는데 그것은 motors_output()
-    // 보다 뒤이므로, 로깅 시점에 motors->get_*() 를 읽으면 CLAW 값이 나온다.
-    // (그러면 인계 중 TDCC 의 MR/MP/MY/MT 가 CLAW 를 자기 자신과 비교하게 된다)
-    float  _ap_roll_out;
-    float  _ap_pitch_out;
-    float  _ap_yaw_out;
-    float  _ap_throttle_out;
+        bool     auto_pending;          // 반영 대기 중인 자동 진행 명령 (12 / 13) 이 있는가
+        State    auto_state;            // AUTO_TO_TRACKING / AUTO_TO_CLOSE
+    } _gcs_cmd;
 
-    // --- 파라미터 ---
+    // 자동 진행 (state 12 / 13).  _state 가 12 / 13 인 동안 그 안에서 실제로
+    // 실행 중인 단계가 _auto_step 이다.  단계가 TDCN_AUTO_DWELL 동안 계속 완료
+    // 상태면 다음 단계로 넘어간다.
+    State    _auto_step;
+    bool     _auto_waiting;             // 완료 후 대기 중인가
+    uint32_t _auto_done_ms;             // 완료 상태가 시작된 시각
+
+    void state_auto_to_tracking();      // 12  1~6 자동 진행
+    void state_auto_to_close();         // 13  6~11 자동 진행
+
+    // 자동 진행 공통.  현재 단계가 대기 시간만큼 완료 상태면 다음 단계로 넘긴다.
+    // end 에 닿으면 _state 를 그 state 로 바꿔 자동 진행을 끝낸다.
+    void auto_advance(State end);
+
+    static bool is_auto(State s) {
+        return s == State::AUTO_TO_TRACKING || s == State::AUTO_TO_CLOSE;
+    }
+
+    // 지금 실행 중인 시나리오 단계 (0~11).  자동 진행 중이면 그 안의 단계다.
+    // "지금 이륙 중인가 / 추종 중인가" 를 묻는 곳은 _state 대신 이것을 쓴다.
+    State scenario_state() const { return is_auto(_state) ? _auto_step : _state; }
+
+    // state 전이.  진입 훅을 세우고 완료 판정을 내린다.  같은 state 면 아무것도 안 한다.
+    void change_state(State next);
+
+    // state 4 - 이륙 목표 (EKF origin 기준 NEU cm).  이륙을 시작할 때 잡는다.
+    // XY = 이륙 시작 위치, Z = TDCN_TKO_ALT.  update_status() 의 목표값이 쓴다.
+    Vector3p _takeoff_target_neu_cm;
+
+    // CLAW 출력을 믹서에 넣어도 되는 상태인가.  update_status() 가 판단해
+    // _status.claw_active 에 담는다.
+    bool claw_output_active() const;
+
+    // 현재 상태.  update_status() (run() 4단계) 가 매 루프 채운다.
+    // 위치는 모두 EKF origin 기준 NEU (cm) 라 목표값과 현재값을 바로 뺄 수 있다.
+    struct TdcnStatus {
+        // 목표값 - 지금 state 가 쫓는 목표.  지상 처리 중이면 target_valid = false.
+        //   0~3  공중이면 유지 위치            4  이륙 목표 (이륙 시작 후)
+        //   5,7  유지 위치                     6  GCS 타겟
+        //   8    유지 위치 + 동기 고도         9  착륙 지점 (수평 목표 + home 고도)
+        //   10   disarm 거부로 공중이면 유지 위치
+        bool     target_valid;
+        Vector3p target_pos_neu_cm;
+        float    target_heading_deg;    // 진북 기준 (deg)
+
+        // 현재값
+        Vector3p pos_neu_cm;
+        Vector3f vel_neu_cms;
+        Vector3f euler_rad;             // roll, pitch, yaw
+        Vector3f gyro_rads;             // body p, q, r
+
+        // 제어값 - 믹서 입력 (roll/pitch/yaw -1~1, throttle 0~1)
+        bool  claw_active;              // 5단계에서 CLAW 값으로 대체할 것인가
+        float claw_roll, claw_pitch, claw_yaw, claw_throttle;   // state 6 에서만 유효
+        float ap_roll, ap_pitch, ap_yaw, ap_throttle;           // 5단계가 대체 직전에 채운다
+    } _status;
+
+    // ----- Part 1. 파라미터 (TDCN_*)  mode_tdcn_param.cpp -------------------
     //
     // 소스에 박아 두면 값을 바꿀 때마다 재빌드해야 하고, 실기체에서는 현장에서
     // 조정할 수가 없다.  그래서 시나리오가 쓰는 고도 / 속도를 파라미터로 뺐다.
@@ -2067,8 +2129,9 @@ private:
     // 1 = CLAW 의 제어값 4개를 믹서에 직접 넣는다 (v2)
     AP_Int8  _claw_on_off;
 
-    // CLAW 출력을 믹서에 넣어도 되는 상태인가.  output_to_motors() 가 쓴다.
-    bool claw_output_active() const;
+    // 자동 진행 (GCS 명령 12 / 13) 에서 state 가 완료된 뒤 넘어가기까지 기다리는
+    // 시간 (s).  완료 상태가 이 시간 동안 계속 유지돼야 다음 state 로 넘어간다.
+    AP_Float _auto_dwell;
 };
 #endif
 

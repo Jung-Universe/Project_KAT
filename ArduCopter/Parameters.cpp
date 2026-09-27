@@ -1235,11 +1235,11 @@ const AP_Param::GroupInfo ParametersG2::var_info2[] = {
 
 #if MODE_TDCN_ENABLED
     // @Group: TDCN_
-    // @Path: mode_tdcn.cpp
+    // @Path: mode_tdcn_param.cpp
     AP_SUBGROUPPTR(mode_tdcn_ptr, "TDCN_", 9, ParametersG2, ModeTDCN),
 
     // @Group: CLAW_
-    // @Path: mode_tdcn.cpp
+    // @Path: mode_tdcn_gain.cpp
     AP_SUBGROUPPTR(claw_gains_ptr, "CLAW_", 10, ParametersG2, CLAW_Gains),
 #endif
 

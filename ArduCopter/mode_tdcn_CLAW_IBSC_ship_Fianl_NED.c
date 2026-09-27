@@ -78,6 +78,14 @@ double G_mat[4][4], G_mat_inv[4][4];
 static double state_buffer[4][BUFFER_SIZE];
 static bool buffer_filled = false;
 
+/* Sejong: Estimate_Accel_Hermite() 안의 static 지역변수를 파일 전역으로 옮겼다.
+   함수 안에 있으면 부팅 후 한 번만 0 이라, TDCN 재진입 때 buffer_filled 만 false
+   로 내려도 카운트가 이미 차 있어 워밍업 없이 곧바로 미분을 시작한다.  그러면
+   진입 첫 스텝들의 각가속도가 (현재 각속도 - 이전 세션 마지막 각속도) / DT 로
+   튀어 ACCEL_LIMIT_ANGULAR 에 걸린다.  buffer_filled 와 함께 0 으로 되돌린다.
+   원본: Estimate_Accel_Hermite() 안의  static int init_count = 0;               */
+static int init_count = 0;
+
 // IBSC 안정화를 위한 게인 및 필터 계수 추가
 #define IBSC_DELTA_GAIN  0.1
 static double Est_Acc_Body_Filtered[6] = { 0.0, };
@@ -99,7 +107,6 @@ double Estimate_Accel_Hermite(int axis, double current_val, double dt) {
     state_buffer[axis][0] = current_val;
 
     if (!buffer_filled) {
-        static int init_count = 0;
         if (axis == 3) init_count++;
         if (init_count > BUFFER_SIZE + 5) buffer_filled = true;
         return 0.0;
@@ -171,6 +178,7 @@ void CLAW_step(void)
 
         for (int i = 0; i < 6; i++) Est_Acc_Body_Filtered[i] = 0.0;
         buffer_filled = false;
+        init_count = 0;     /* Sejong: 위 init_count 참고 */
         return;
     }
 
@@ -199,11 +207,21 @@ void CLAW_step(void)
             CLAW_DW.UD_DSTATE_i = 0.0;
             CLAW_DW.UD_DSTATE_p = 0.0;
 
+            /* Sejong: 각가속도 추정기 초기화.
+               init_count 를 함께 0 으로 되돌려 워밍업 (BUFFER_SIZE + 5 스텝) 을
+               다시 거치게 하고, 버퍼는 이번 스텝 입력으로 채운다.  STV[3..5] 는 이
+               아래에서 갱신되므로 여기서 읽으면 직전 스텝 (재진입이면 이전 세션의
+               마지막 스텝) 값이다.
+               원본:
+                   state_buffer[1][k] = STV[3];
+                   state_buffer[2][k] = STV[4];
+                   state_buffer[3][k] = STV[5];                                   */
             buffer_filled = false;
+            init_count = 0;
             for (int k = 0; k < BUFFER_SIZE; k++) {
-                state_buffer[1][k] = STV[3];
-                state_buffer[2][k] = STV[4];
-                state_buffer[3][k] = STV[5];
+                state_buffer[1][k] = (double)CLAW_U.p;
+                state_buffer[2][k] = (double)CLAW_U.q;
+                state_buffer[3][k] = (double)CLAW_U.r;
             }
             for (int k = 0; k < 6; k++) Est_Acc_Body_Filtered[k] = 0.0;
 
@@ -219,6 +237,16 @@ void CLAW_step(void)
                 ddXtraj[i] = 0.0;
                 Prev_CTRL[i] = 0.0;
             }
+
+            /* Sejong: 요 궤적은 현재 헤딩에서 출발시킨다.
+               Xtraj[3] 은 요 목표이고 0 은 진북이다.  0 으로 두면 이 스텝의 z1[3] 이
+               현재 헤딩 전체가 되어 cmd_yaw 가 포화한다 (진입 헤딩 121 도에서 1.0).
+               TDCN 이 CLAW_step() 뒤에 Xtraj[3] 을 고쳐 왔지만, 그때는 이 스텝의
+               출력이 이미 계산된 뒤라 잘못된 첫 출력이 한 루프 믹서로 나갔다.
+               STV[8] 은 아직 갱신 전이라 입력을 직접 읽는다 (아래 STV[8] 과 같은 식).
+               dXtraj[3] / ddXtraj[3] 은 위 for 문에서 0 이 됐다.                     */
+            Xtraj[3] = wrapToPi((double)CLAW_U.DR_heading_f.DR_heading);
+
             home_init = true;
         }
     }
