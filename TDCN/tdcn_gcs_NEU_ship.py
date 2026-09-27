@@ -61,7 +61,9 @@ state 6 에서 tdcn_gcs_NEU.py 가 손으로 받던 타겟 4개를, 배의 운�
 -----------------------
 실제 GCS 는 배의 현재 상태를 주기적으로 흘릴 뿐, 놓친 값을 다시 보내지 않는다.
 다음 발이 항상 더 새로운 정보를 담고 있기 때문이다.  이 스크립트도 같다.
-(state 전환만 ACK 까지 재시도한다 — 원본의 send_until_ready 가 한다.)
+state 전환도 재시도하지 않는다.  기체가 거부(DENIED)하면 조작자가 다시 입력한다
+(입력한 대로 움직였는지 봐야 하므로).  거부 이유는 tdcn_gcs_NEU.py 가 추정해
+보여준다.  기체가 TDCN 모드를 벗어나면 배 상태 전송도 멈춘다.
 
 
 사용 예
@@ -119,6 +121,7 @@ SHIP_START_EAST = 0.0
 
 
 from tdcn_gcs_NEU import (        # noqa: E402
+    AUTO_CMDS,
     STATES,
     TARGET_STATE,
     Quit,
@@ -620,6 +623,13 @@ class ShipFeed:
             now = time.time()
             t = now - t0
 
+            # TDCN 을 벗어나면 기체는 state 6 을 모두 거부한다.  계속 보내 봐야
+            # 소용없고, 다시 들어오면 state 1 부터 시작해야 한다.
+            if not self._gcs.in_tdcn:
+                print(f"\n[feed] 기체가 TDCN 모드를 벗어나 전송을 멈춥니다 "
+                      f"({self.sent}발 전송)")
+                break
+
             if t >= self._ship.duration and not self.arrived:
                 self.arrived = True
                 n, e, h = self._ship.at(self._ship.duration)
@@ -673,6 +683,9 @@ def print_menu(ship: Ship, update_rate: float, send_rate: float,
           f"{send_rate:g}Hz 로 보냅니다.")
     print(f"    궤적을 한 번만 지나고, 끝나면 그 자리 값을 계속 보냅니다.")
     print(f"    실행 중 아무 때나 7 을 넣으면 바로 전환합니다.")
+    for num, (name, desc, _end) in AUTO_CMDS.items():
+        print(f"  {num:2d}  {name:<13} {desc}")
+    print(f"\n  * 12 로 6 까지 간 뒤 {TARGET_STATE} 을 누르면 배 상태 전송이 시작됩니다.")
     print(f"\n  p   플롯 보기")
     print(f"  l   전송할 값 목록")
     print(f"  q   종료")
@@ -685,7 +698,7 @@ def interactive(gcs: TdcnGCS, ship: Ship, update_rate: float,
     print_menu(ship, update_rate, send_rate, alt)
     while True:
         try:
-            text = _ask("\nstate (1-11, p=플롯, l=목록, 엔터=메뉴, q=종료) > ")
+            text = _ask("\nstate (1-13, p=플롯, l=목록, 엔터=메뉴, q=종료) > ")
 
             # 무엇을 하든 전송을 먼저 멈춘다.  전송 스레드가 state 6 을 계속
             # 쏘고 있으면 다음 state 전환과 충돌한다.  stop() 은 스레드가
@@ -711,20 +724,22 @@ def interactive(gcs: TdcnGCS, ship: Ship, update_rate: float,
             except ValueError:
                 print("  숫자 또는 p / l / q 를 입력하세요.")
                 continue
-            if state not in STATES:
-                print(f"  state 는 1~11 이어야 합니다 (받은 값: {state})")
+            if state not in STATES and state not in AUTO_CMDS:
+                print(f"  state 는 1~13 이어야 합니다 (받은 값: {state})")
                 continue
 
             if state != TARGET_STATE:
-                # state 전환은 반드시 도달해야 하므로 ACK 까지 재시도한다
-                gcs.send_until_ready(state)
+                # 한 번 입력 = 한 번 전송.  거부되면 조작자가 다시 입력한다
+                gcs.send(state)
                 continue
 
             # --- state 6: 여기부터 끝까지 자동 ---
             # 조작자는 6 을 한 번 누르고 끝이다.  타겟 입력이 없다.
             print_plan(ship, update_rate, send_rate, alt)
             first, _ = ship.target_at(0.0, update_rate, alt)
-            gcs.send_until_ready(state, first)
+            if gcs.send(state, first) != "ACCEPTED":
+                print("[feed] state 6 이 거부되어 배 상태를 보내지 않습니다")
+                continue
             feed = ShipFeed(gcs, ship, update_rate, send_rate, alt)
             feed.start()
 

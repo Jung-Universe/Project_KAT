@@ -8,6 +8,13 @@ SITL(또는 실기체)로 MAV_CMD_USER_1 (31010) 을 보내 TDCN 시나리오 �
 대화형 모드는 키보드로 state 번호(1~11)를 받고, state 6(추종 비행)일 때만
 타겟 정보 4개를 추가로 받아 함께 전송한다.
 
+12 / 13 은 state 가 아니라 자동 진행 명령이다.
+    12   state 0~5 에서 보내면 6 까지 자동으로 진행한다.  6 의 초기 목표는 그 순간의
+         현재 위치 / 헤딩이고, 이후 state 6 타겟을 보내면 그것을 따라간다.
+    13   state 6~10 에서 보내면 11 까지 자동으로 진행한다.
+기체는 각 state 가 완료된 뒤 TDCN_AUTO_DWELL 초 동안 완료가 유지돼야 다음으로
+넘어간다.  진행 상황은 기체가 보내는 [기체] TDCN: auto ... 메시지로 보인다.
+
 COMMAND_INT 필드 매핑  (COMMAND_LONG 이 아니다!)
 ------------------------------------------------
     frame   uint8   1 = MAV_FRAME_LOCAL_NED   x/y 가 home 기준 NEU 라는 선언
@@ -26,6 +33,26 @@ CLAW 와 위치제어에 넘긴다.  최종 결과물에서는 tdcn_gcs_Lat_Lon.
 Heading 은 진북(True North) 기준 deg 이다.  이 스크립트는 입력값을 정규화하지
 않고 그대로 전송한다 — 정규화(0~360 / ±180)나 rad 변환이 필요하면
 Target.as_params() 한 곳만 고치면 된다.
+
+ACK
+---
+기체의 응답은 ACCEPTED / DENIED 두 가지뿐이다.
+
+    ACCEPTED   입력대로 반영했다
+    DENIED     입력 거부.  기체는 하던 일을 계속한다.  이유는 기체가 보내지
+               않으므로 이 스크립트가 추정해서 보여준다:
+                 - 기체가 TDCN 모드가 아님 (HEARTBEAT 로 확인)
+                 - 현재 단계가 아직 완료되지 않음 (바로 다음 번호일 때)
+                 - 순서 위반 (건너뛰기 / 되돌아가기)
+                 - 값 오류 (state 6 타겟, home 미설정 등)
+
+대화형 입력은 거부되어도 재시도하지 않는다 — 입력한 대로 움직였는지 봐야
+하므로, 거부되면 조작자가 다시 입력한다.  --scenario 자동 재생만 사람 대신
+재시도한다.
+
+기체는 TDCN 모드에 들어올 때마다 state 0 (NONE) 부터 시작한다.  이 스크립트는
+HEARTBEAT 로 모드를 보다가 TDCN 에 들어오거나 벗어나면 알리고, 자기가 기억하는
+state 도 0 으로 되돌린다.
 
 사용 예
 -------
@@ -55,6 +82,7 @@ import argparse
 import json
 import math
 import queue
+import re
 import sys
 import threading
 import time
@@ -67,6 +95,9 @@ except ImportError:
 
 
 MAV_CMD_USER_1 = 31010
+
+# ArduCopter 의 TDCN 비행모드 번호 (HEARTBEAT.custom_mode)
+TDCN_MODE = 29
 
 # COMMAND_INT 의 frame.  1 = 좌표가 home 기준 NEU 라는 선언.
 # 최종 결과물에서 위경도로 보낼 때는 3 (MAV_FRAME_GLOBAL_RELATIVE_ALT) 을 쓴다.
@@ -88,6 +119,13 @@ STATES: dict[int, tuple[str, str]] = {
     9:  ("LANDING_STOW",  "착륙 수납"),
     10: ("DISARMED",      "DISARMED"),
     11: ("HANGAR_CLOSE",  "격납함 닫기"),
+}
+
+# 자동 진행 명령 -> (짧은 이름, 설명, 멈추는 state).  state 가 아니라 "여기까지
+# 알아서 진행하라" 는 요청이다.
+AUTO_CMDS: dict[int, tuple[str, str, int]] = {
+    12: ("AUTO_1_6",  "1~6 자동 진행 (6 의 초기 목표 = 현재 위치)", 6),
+    13: ("AUTO_6_11", "6~11 자동 진행", 11),
 }
 
 MAV_RESULT_NAMES = {
@@ -200,6 +238,10 @@ class TdcnGCS:
         # 기체는 모드 진입 시 NONE(0) 에서 시작한다.
         self.state: int = 0
 
+        # 기체의 현재 비행모드 (HEARTBEAT.custom_mode).  None = 아직 모름.
+        # DENIED 의 이유를 추정하고, TDCN 진입/이탈을 알리는 데 쓴다.
+        self.vehicle_mode: int | None = None
+
         self._acks: queue.Queue = queue.Queue()
         self._latest: dict[str, object] = {}
         self._stop = threading.Event()
@@ -221,15 +263,56 @@ class TdcnGCS:
                 self._acks.put(msg)
             elif mtype in ("HEARTBEAT", "STATUSTEXT"):
                 self._latest[mtype] = msg
+                if (mtype == "HEARTBEAT"
+                        and msg.get_srcSystem() == self.target_system
+                        and msg.get_srcComponent() == self.target_component):
+                    self._on_vehicle_mode(msg.custom_mode)
                 if mtype == "STATUSTEXT":
                     # TDCN 이 보내는 진행 상황(예: prearm OK/FAIL)은 조작자가
                     # 다음 단계로 넘어가도 되는지 판단하는 근거라 강조해 둔다.
                     if "TDCN" in msg.text:
                         print(f"\n  [기체] {msg.text}")
+                        self._on_tdcn_text(msg.text)
                     elif self.verbose:
                         # EKF/GPS 초기화 같은 기체 기본 메시지.  입력 프롬프트를
                         # 덮어버리므로 --verbose 일 때만 보여준다.
                         print(f"\n[vehicle] {msg.text}")
+
+    def _on_tdcn_text(self, text: str) -> None:
+        """자동 진행 중에는 기체가 스스로 state 를 넘긴다.  그 알림으로 state 를 맞춘다.
+
+          TDCN: auto state N          N 으로 넘어갔다
+          TDCN: auto done (state N)   자동 진행이 N 에서 끝났다
+        """
+        m = re.search(r"auto (?:state (\d+)|done \(state (\d+)\))", text)
+        if m:
+            self.state = int(m.group(1) or m.group(2))
+
+    def _on_vehicle_mode(self, mode: int) -> None:
+        """비행모드 변화를 알린다.  TDCN 에 들어오거나 벗어나면 state 를 0 으로."""
+        prev = self.vehicle_mode
+        self.vehicle_mode = mode
+        if prev == mode:
+            return
+        if prev is None:
+            if mode != TDCN_MODE:
+                print(f"\n  [기체] TDCN 모드가 아닙니다 (현재 모드 {mode}).  "
+                      f"TDCN 으로 바꾸기 전까지 입력은 거부됩니다.")
+            return
+        if mode == TDCN_MODE:
+            print("\n  [기체] TDCN 모드 진입 — state 1 부터 입력하세요")
+        elif prev == TDCN_MODE:
+            print(f"\n  [기체] TDCN 모드를 벗어났습니다 (현재 모드 {mode}).  "
+                  f"다시 들어오면 state 1 부터 시작합니다")
+        else:
+            return
+        # 기체는 TDCN 에 들어올 때마다 state 0 (NONE) 부터 시작한다
+        self.state = 0
+
+    @property
+    def in_tdcn(self) -> bool:
+        """기체가 TDCN 모드인가.  아직 모르면 True 로 본다 (막지 않는다)."""
+        return self.vehicle_mode is None or self.vehicle_mode == TDCN_MODE
 
     def close(self) -> None:
         self._stop.set()
@@ -250,8 +333,8 @@ class TdcnGCS:
     def send(self, state: int, target: Target | None = None,
              wait_ack: bool = True, quiet: bool = False) -> str | None:
         """MAV_CMD_USER_1 한 발 전송.  state 6 이 아니면 타겟 파라미터는 0."""
-        if state not in STATES:
-            raise ValueError(f"알 수 없는 state: {state} (1~11)")
+        if state not in STATES and state not in AUTO_CMDS:
+            raise ValueError(f"알 수 없는 state: {state} (1~13)")
 
         if state == TARGET_STATE:
             if target is None:
@@ -290,7 +373,7 @@ class TdcnGCS:
         )
 
         if not quiet:
-            name, desc = STATES[state]
+            name, desc = STATES.get(state) or AUTO_CMDS[state][:2]
             line = f"[tx] state={state:<2} {name:<13} ({desc})"
             if state == TARGET_STATE:
                 line += f"  {target}"
@@ -300,27 +383,30 @@ class TdcnGCS:
             return None
         return self._wait_ack(sent_state=state, quiet=quiet)
 
-    def send_until_ready(self, state: int, target: "Target | None" = None,
-                         timeout: float = 60.0,
-                         retry_period: float = 1.0) -> str | None:
-        """state 를 보내고, 아직 완료 전이면 될 때까지 대신 재시도한다.
+    def send_until_accepted(self, state: int, target: "Target | None" = None,
+                            timeout: float = 60.0,
+                            retry_period: float = 1.0) -> str | None:
+        """--scenario 자동 재생 전용.  ACCEPTED 가 될 때까지 재시도한다.
 
-        기체는 순서가 맞아도 현재 단계가 끝나지 않았으면
-        TEMPORARILY_REJECTED 로 돌려보낸다.  조작자가 그걸 손으로 반복해서
-        누를 필요가 없도록 여기서 자동으로 다시 보낸다.
+        대화형 입력에서는 쓰지 않는다 — 입력한 대로 움직였는지 봐야 하므로
+        거부되면 거부로 끝내고 조작자가 다시 입력한다.  자동 재생은 사람 대신
+        "다시 입력" 을 반복하는 것이다.
 
-        멈추는 조건
-          ACCEPTED  성공 - 다음 단계로 넘어갔다
-          DENIED    순서 자체가 틀렸다 - 재시도해도 소용없으므로 즉시 중단
-          timeout   그때까지 완료되지 않았다
+        기체는 현재 단계가 끝나지 않았을 때도 DENIED 를 준다.  그래서 재시도로
+        풀릴 수 있는 경우 (TDCN 모드이고, 같은 번호 또는 바로 다음 번호) 에만
+        재시도하고, 그 밖의 거부는 즉시 중단한다.
         """
         result = self.send(state, target)
-        if result != "TEMPORARILY_REJECTED":
-            return result
-
         deadline = time.time() + timeout
         waited = 0.0
-        while time.time() < deadline:
+        while result == "DENIED" and time.time() < deadline:
+            if not self.in_tdcn:
+                print("     -> 중단  기체가 TDCN 모드가 아닙니다.")
+                return result
+            if state not in (self.state, self.state + 1):
+                print("     -> 중단  순서 위반은 재시도해도 소용없습니다.")
+                return result
+
             time.sleep(retry_period)
             waited += retry_period
 
@@ -328,32 +414,43 @@ class TdcnGCS:
             result = self.send(state, target, quiet=True)
             if result == "ACCEPTED":
                 name, desc = STATES.get(state, ("?", "?"))
-                print(f"     -> OK   완료되어 state {state} {name} ({desc}) "
-                      f"진입  ({waited:.0f}초 대기)")
+                print(f"     -> OK   state {state} {name} ({desc}) 진입  "
+                      f"({waited:.0f}초 대기)")
                 self.state = state
-                return result
-            if result == "DENIED":
-                print(f"     -> 거부  순서 위반으로 바뀌었습니다.  중단합니다.")
                 return result
 
             # 5초마다 한 번씩만 대기 중임을 알린다
             if int(waited) % 5 == 0:
                 print(f"        ... 대기 중 ({waited:.0f}초)")
 
-        print(f"     -> 시간 초과  {timeout:.0f}초 안에 완료되지 않았습니다.")
+        if result == "DENIED":
+            print(f"     -> 시간 초과  {timeout:.0f}초 안에 받아들여지지 않았습니다.")
         return result
+
+    def _denied_reason(self, sent_state: int) -> str:
+        """DENIED 의 이유를 추정한다.  기체는 이유를 따로 보내지 않는다."""
+        cur = self.state
+        if not self.in_tdcn:
+            return (f"기체가 TDCN 모드가 아닙니다 (현재 모드 {self.vehicle_mode}).  "
+                    f"TDCN 으로 바꾼 뒤 state 1 부터 입력하세요.")
+        if sent_state == 12:
+            return f"12 는 state 0~5 에서만 가능합니다 (현재 state {cur})."
+        if sent_state == 13:
+            return f"13 은 state 6~10 에서만 가능합니다 (현재 state {cur})."
+        if sent_state == TARGET_STATE and sent_state in (cur, cur + 1):
+            return "타겟 값이 거부되었습니다 (값 오류 또는 home 미설정)."
+        if sent_state == cur + 1:
+            cname = STATES.get(cur, ("NONE", "명령 대기"))[0]
+            return (f"state {cur}({cname}) 가 아직 완료되지 않았습니다.  "
+                    f"완료된 뒤 다시 입력하세요.")
+        return (f"순서 위반.  현재 state {cur} 이므로 다음은 state {cur + 1} "
+                f"만 가능합니다.")
 
     def _wait_ack(self, sent_state: int = 0, quiet: bool = False) -> str | None:
         """ACK 를 받아 조작자가 바로 알아볼 수 있게 해석해 출력한다.
 
-        기체는 state 순서를 단방향으로 강제한다.  거부 이유가 두 가지라서
-        ACK 로 구분해 준다:
-
-          DENIED                순서가 틀렸다 (건너뛰기 / 되돌아가기).
-                                다시 보내도 소용없다.
-          TEMPORARILY_REJECTED  다음 번호는 맞는데 현재 단계가 아직 안 끝났다.
-                                잠시 뒤 다시 누르면 통과한다.
-          ACCEPTED              정상 반영.
+          ACCEPTED   입력대로 반영했다
+          DENIED     입력 거부.  이유는 _denied_reason() 이 추정한다.
         """
         deadline = time.time() + self.ack_timeout
         while time.time() < deadline:
@@ -366,25 +463,19 @@ class TdcnGCS:
             result = MAV_RESULT_NAMES.get(ack.result, str(ack.result))
 
             if not quiet:
-                if ack.result == 0:                       # ACCEPTED
+                if ack.result == 0 and sent_state in AUTO_CMDS:
+                    end = AUTO_CMDS[sent_state][2]
+                    print(f"     -> OK   자동 진행 시작 (state {end} 까지, 단계마다 "
+                          f"TDCN_AUTO_DWELL 초 대기)")
+                elif ack.result == 0:                     # ACCEPTED
                     if sent_state == self.state:
                         print(f"     -> state {sent_state} 유지 중")
                     else:
                         self.state = sent_state
                         name, desc = STATES.get(sent_state, ("?", "?"))
                         print(f"     -> OK   state {sent_state} {name} ({desc}) 진입")
-                elif ack.result == 1:                     # TEMPORARILY_REJECTED
-                    cur = self.state
-                    cname = STATES.get(cur, ("NONE", "명령 대기"))[0]
-                    print(f"     -> 대기  state {cur}({cname}) 가 아직 완료되지 "
-                          f"않았습니다.")
-                    print(f"             잠시 뒤 state {sent_state} 를 다시 "
-                          f"보내면 넘어갑니다.")
                 elif ack.result == 2:                     # DENIED
-                    cur = self.state
-                    nxt = cur + 1
-                    print(f"     -> 거부  순서 위반.  현재 state {cur} 이므로 "
-                          f"다음은 state {nxt} 만 가능합니다.")
+                    print(f"     -> 거부  {self._denied_reason(sent_state)}")
                 else:
                     print(f"     -> {result}")
             return result
@@ -412,6 +503,12 @@ class TdcnGCS:
                 # 첫 발만 ACK 를 확인하고, 이후에는 조용히 스트리밍한다
                 if n == 0:
                     first_ack = self.send(target=target, state=TARGET_STATE)
+                    if first_ack != "ACCEPTED":
+                        print("[stream] 첫 발이 받아들여지지 않아 스트리밍하지 않습니다")
+                        return
+                elif not self.in_tdcn:
+                    print("\n[stream] 기체가 TDCN 모드를 벗어나 스트리밍을 멈춥니다")
+                    break
                 else:
                     self.send(state=TARGET_STATE, target=target,
                               wait_ack=False, quiet=True)
@@ -439,16 +536,22 @@ class TdcnGCS:
                 target = Target(**tgt_cfg)
                 if step.get("stream", True):
                     # 스트리밍 전에 6번이 받아들여질 때까지 기다린다
-                    self.send_until_ready(state, target, timeout=180.0)
+                    result = self.send_until_accepted(state, target, timeout=180.0)
+                    if result != "ACCEPTED":
+                        print("[scenario] 중단")
+                        return
                     self.stream_target(target, duration=dwell, rate=rate)
                     continue
-                self.send_until_ready(state, target, timeout=180.0)
+                result = self.send_until_accepted(state, target, timeout=180.0)
             else:
                 # 앞 단계가 끝날 때까지 자동으로 재시도한다.  dwell 만 믿고
                 # 다음 번호를 보내면 이륙(약 10초) 처럼 오래 걸리는 단계에서
-                # TEMPORARILY_REJECTED 를 맞고 시나리오가 멈춘다.
-                self.send_until_ready(state, timeout=180.0)
+                # 거부(DENIED)를 맞는다.
+                result = self.send_until_accepted(state, timeout=180.0)
 
+            if result != "ACCEPTED":
+                print("[scenario] 중단")
+                return
             time.sleep(dwell)
         print("\n[scenario] 완료")
 
@@ -477,12 +580,14 @@ def print_states() -> None:
     for num, (name, desc) in STATES.items():
         mark = "   <-- 타겟 정보 4개 추가 입력" if num == TARGET_STATE else ""
         print(f"  {num:2d}  {name:<13} {desc}{mark}")
+    for num, (name, desc, _end) in AUTO_CMDS.items():
+        print(f"  {num:2d}  {name:<13} {desc}")
 
 
 def ask_state() -> int:
-    """state 번호(1~11)를 받는다.  빈 입력이면 목록을 다시 보여준다."""
+    """state 번호(1~11) 또는 자동 진행 명령(12, 13)을 받는다.  빈 입력이면 목록."""
     while True:
-        text = _ask("\nstate (1-11, 엔터=목록, q=종료) > ")
+        text = _ask("\nstate (1-13, 엔터=목록, q=종료) > ")
         if not text:
             print_states()
             continue
@@ -491,8 +596,8 @@ def ask_state() -> int:
         except ValueError:
             print("  숫자를 입력하세요.")
             continue
-        if state not in STATES:
-            print(f"  state 는 1~11 이어야 합니다 (받은 값: {state})")
+        if state not in STATES and state not in AUTO_CMDS:
+            print(f"  state 는 1~13 이어야 합니다 (받은 값: {state})")
             continue
         return state
 
@@ -528,11 +633,12 @@ def interactive(gcs: TdcnGCS) -> None:
     while True:
         try:
             state = ask_state()
+            # 한 번 입력 = 한 번 전송.  거부되면 재시도하지 않는다 (위 ACK 설명 참고)
             if state == TARGET_STATE:
                 target = ask_target(target)
-                gcs.send_until_ready(state, target)
+                gcs.send(state, target)
             else:
-                gcs.send_until_ready(state)
+                gcs.send(state)
         except Quit:
             print("종료합니다.")
             return
@@ -586,8 +692,8 @@ def main() -> int:
         print_states()
         return 0
 
-    if args.state is not None and args.state not in STATES:
-        ap.error(f"--state 는 1~11 이어야 합니다 (받은 값: {args.state})")
+    if args.state is not None and args.state not in STATES and args.state not in AUTO_CMDS:
+        ap.error(f"--state 는 1~13 이어야 합니다 (받은 값: {args.state})")
 
     gcs = TdcnGCS(args.connect, target_system=args.sysid,
                   target_component=args.compid,
