@@ -2023,13 +2023,6 @@ private:
     // 일찍 리턴하면 "진입" 정보가 사라진다.  그래서 별도 플래그로 들고 있는다.
     bool _takeoff_started;
 
-    // 이륙 전 state (0~3) 의 기체 처리.  지상이면 안전 처리, 공중이면 제자리
-    // 유지.  비행 중에 TDCN 으로 모드를 바꿔도 기체가 가라앉지 않게 한다.
-    void preflight_vehicle_handling();
-
-    // 위 처리에서 잡을 위치를 이미 정했는가.  지상으로 내려오면 다시 내린다.
-    bool _air_hold_valid;
-
     // state 2 - 마지막으로 GCS 에 알린 pre-arm 결과.  400Hz 로 같은 내용을
     // 반복해 보내지 않기 위해 결과가 바뀔 때만 알린다.
     bool _prearm_ready;
@@ -2101,7 +2094,7 @@ private:
     // 위치는 모두 EKF origin 기준 NEU (cm) 라 목표값과 현재값을 바로 뺄 수 있다.
     struct TdcnStatus {
         // 목표값 - 지금 state 가 쫓는 목표.  지상 처리 중이면 target_valid = false.
-        //   0~3  공중이면 유지 위치            4  이륙 목표 (이륙 시작 후)
+        //   0~3  없음 (지상 대기)              4  이륙 목표 (이륙 시작 후)
         //   5,7  유지 위치                     6  GCS 타겟
         //   8    유지 위치 + 동기 고도         9  착륙 지점 (수평 목표 + home 고도)
         //   10   disarm 거부로 공중이면 유지 위치

@@ -12,6 +12,13 @@ volatile uint8_t Arming = 0;
 /* 모드 진입시 1회 실행 */
 bool ModeTDCN::init(bool ignore_checks)
 {
+    // TDCN 은 지상에서만 시작한다.  state 0~3 은 지상 처리만 하므로, 공중에서
+    // 들어오면 아무도 기체를 잡지 않는다.  거부하면 이전 모드가 유지된다.
+    if (!copter.ap.land_complete) {
+        gcs().send_text(MAV_SEVERITY_WARNING, "%s: start on the ground only", name());
+        return false;
+    }
+
     _state = State::NONE;
     _gcs_cmd.pending = false;
     _gcs_cmd.auto_pending = false;
@@ -31,7 +38,6 @@ bool ModeTDCN::init(bool ignore_checks)
     _state_done = true;
     _action_retry_ms = 0;
     _was_armed = motors->armed();
-    _air_hold_valid = false;
 
     _armed_ms = AP_HAL::millis();
     _armed_prev = motors->armed();
@@ -66,7 +72,7 @@ void ModeTDCN::run()
     // 3. state 별 처리
     switch (_state) 
     {
-        case State::NONE:             preflight_vehicle_handling(); break;
+        case State::NONE:             make_safe_ground_handling();  break;
 
         case State::HANGAR_OPEN:      state_hangar_open();          break;      // 1  격납함 열기
 
@@ -295,8 +301,7 @@ void ModeTDCN::update_status()
     case State::NONE:
     case State::HANGAR_OPEN:
     case State::TAKEOFF_WAIT:
-    case State::ARMED:
-        valid = flying && _air_hold_valid;              // 공중이면 유지 위치
+    case State::ARMED:                                  // 지상 대기 - 목표 없음
         break;
     case State::LAUNCH:
         valid = _takeoff_started;                       // 이륙 목표
@@ -449,24 +454,17 @@ bool ModeTDCN::claw_output_active() const
 
 void ModeTDCN::output_to_motors()
 {
-    // 5. 제어값 실행
-    //
-    // ArduPilot 제어값은 이 시점에 확정된다 (바로 앞 run_rate_controller 의 출력).
-    // 대체하면 사라지므로 먼저 떠 둔다.  롤/피치/요는 믹서가 쓰는 대로 PID +
-    // 피드포워드, 스로틀은 ArduPilot 이 요구한 값 (angle boost 전) 이다.
     _status.ap_roll     = motors->get_roll()  + motors->get_roll_ff();
     _status.ap_pitch    = motors->get_pitch() + motors->get_pitch_ff();
     _status.ap_yaw      = motors->get_yaw()   + motors->get_yaw_ff();
     _status.ap_throttle = attitude_control->get_throttle_in();
 
-    // 대체만 한다.  대체할지와 대체할 값은 4번 (update_status) 이 정해 두었다.
     if (_status.claw_active) {
         motors->set_roll(_status.claw_roll);
         motors->set_pitch(_status.claw_pitch);
         motors->set_yaw(_status.claw_yaw);
         motors->set_throttle(_status.claw_throttle);
 
-        // 아두파일럿 각속도 PID 의 피드포워드가 더해지지 않게 지운다
         motors->set_roll_ff(0.0f);
         motors->set_pitch_ff(0.0f);
         motors->set_yaw_ff(0.0f);
@@ -479,64 +477,19 @@ void ModeTDCN::Run_CLAW()
 {
     claw_gains.apply();       
     Update_Info_for_CLAW();
-
-    // 요 궤적 초기화 (Xtraj[3] = 현재 헤딩) 는 CLAW.c 의 home 블록이 한다
-    CLAW_step();                // CLAW 실행 (CLAW.c 의 함수 직접 호출)
-}
-
-void ModeTDCN::preflight_vehicle_handling()
-{
-    if (is_disarmed_or_landed()) {
-        make_safe_ground_handling();
-        _air_hold_valid = false;    // 다음에 공중에 뜨면 위치를 새로 잡는다
-        return;
-    }
-
-    // 공중이다.  잡을 위치를 한 번만 정한다.
-    if (!_air_hold_valid) {
-        _air_hold_valid = true;
-
-        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                            wp_nav->get_wp_acceleration());
-        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                                    wp_nav->get_wp_acceleration());
-        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(),
-                                            wp_nav->get_default_speed_up(),
-                                            wp_nav->get_accel_z());
-        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(),
-                                                    wp_nav->get_default_speed_up(),
-                                                    wp_nav->get_accel_z());
-
-        // 다른 모드에서 막 넘어왔을 수 있으므로 정지점 기준으로 초기화한다.
-        pos_control->init_xy_controller_stopping_point();
-        pos_control->init_z_controller_stopping_point();
-        auto_yaw.set_mode(AutoYaw::Mode::HOLD);
-
-        _hold_pos_neu_cm = pos_control->get_pos_desired_cm();
-    }
-
-    motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
-
-    pos_control->input_pos_xyz(_hold_pos_neu_cm, 0.0f, 0.0f);
-    pos_control->update_xy_controller();
-    pos_control->update_z_controller();
-    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(),
-                                                  auto_yaw.get_heading());
+    CLAW_step();           
 }
 
 void ModeTDCN::state_hangar_open()      // 1 격납함 열기
 {
-    // 기체가 할 일이 없다.  격납함 개폐는 기체 밖에서 처리된다.
-    _state_done = true;         // 즉시 완료 - 2번으로 넘어가도 된다
-
-    preflight_vehicle_handling();
+    _state_done = true;
+    make_safe_ground_handling();
 }
 
 void ModeTDCN::state_takeoff_wait()     // 2 이륙 대기 (prearm check)
 {
     const bool ready = copter.ap.pre_arm_check;
 
-    // 완료 판정: arm 이 가능해야 3번으로 넘어갈 수 있다
     _state_done = ready;
 
     if (_state_entered || ready != _prearm_ready) {
@@ -545,12 +498,11 @@ void ModeTDCN::state_takeoff_wait()     // 2 이륙 대기 (prearm check)
                         "%s: prearm %s", name(), ready ? "OK" : "FAIL");
     }
 
-    preflight_vehicle_handling();
+    make_safe_ground_handling();
 }
 
 void ModeTDCN::state_armed()            // 3 ARMED
 {
-    // 완료 판정: 실제로 무장돼야 4번으로 넘어갈 수 있다
     _state_done = motors->armed();
 
     if (!_state_done) {
@@ -562,10 +514,10 @@ void ModeTDCN::state_armed()            // 3 ARMED
     }
     _was_armed = motors->armed();
 
-    preflight_vehicle_handling();
+    make_safe_ground_handling();
 }
 
-static const uint32_t _takeoff_settle_ms = 2000;    // 2 초
+static const uint32_t _takeoff_settle_ms = 1000;    // 1 초
 
 void ModeTDCN::state_launch()           // 4 이륙 사출
 {
@@ -582,9 +534,9 @@ void ModeTDCN::state_launch()           // 4 이륙 사출
         }
         if (!motors->armed()) {
             make_safe_ground_handling();
-            return;                 // 아직 무장 못 함.  다음 루프에서 재시도
+            return;                
         }
-        _takeoff_started = false;   // 재무장했으니 이륙을 처음부터 다시 시작
+        _takeoff_started = false; 
     }
 
     if (!_takeoff_started && is_disarmed_or_landed() &&
@@ -594,88 +546,49 @@ void ModeTDCN::state_launch()           // 4 이륙 사출
     }
 
     if (!_takeoff_started) {
-        // --- 이륙 시작 (ModeGuided::do_user_takeoff_start() 와 같은 순서) ---
-
-        // 이륙 중에는 heading 을 유지한다
         auto_yaw.set_mode(AutoYaw::Mode::HOLD);
 
-        // 상승 속도 제한.  하강 속도도 같은 값으로 둔다 (이륙에는 쓰이지 않지만
-        // 컨트롤러 한계를 비대칭으로 두지 않는다).
-        pos_control->set_max_speed_accel_z(-_takeoff_spd, _takeoff_spd,
-                                          g.pilot_accel_z);
-        pos_control->set_correction_speed_accel_z(-_takeoff_spd, _takeoff_spd,
-                                                  g.pilot_accel_z);
-
-        // 수직 위치 컨트롤러 초기화 (I 항 클리어)
+        pos_control->set_max_speed_accel_z(-_takeoff_spd, _takeoff_spd, g.pilot_accel_z);
+        pos_control->set_correction_speed_accel_z(-_takeoff_spd, _takeoff_spd, g.pilot_accel_z);
         pos_control->init_z_controller();
 
-        // auto_takeoff 는 목표 고도를 EKF origin 기준 cm 로 받는다.
-        // _takeoff_alt 은 home 기준이므로 변환한다.
         Location target_loc = copter.current_loc;
         target_loc.set_alt_cm((int32_t)_takeoff_alt, Location::AltFrame::ABOVE_HOME);
         int32_t alt_above_origin_cm;
-        if (!target_loc.get_alt_cm(Location::AltFrame::ABOVE_ORIGIN,
-                                   alt_above_origin_cm)) {
+        if (!target_loc.get_alt_cm(Location::AltFrame::ABOVE_ORIGIN, alt_above_origin_cm)) {
             gcs().send_text(MAV_SEVERITY_WARNING, "%s: takeoff alt failed", name());
             return;
         }
         auto_takeoff.start((float)alt_above_origin_cm, false);
 
-        // update_status() 의 목표값 (이륙 목표).  XY 는 이륙 시작 위치다.
         _takeoff_target_neu_cm = inertial_nav.get_position_neu_cm().topostype();
         _takeoff_target_neu_cm.z = alt_above_origin_cm;
 
-        // auto_takeoff.run() 은 ap.auto_armed 가 false 면 즉시 리턴한다.
-        // auto_armed 는 조종기 스로틀을 올려야 켜지는데 (system.cpp 의
-        // update_auto_armed), 이 시나리오에는 스틱이 없으므로 직접 세운다.
-        // Copter::start_takeoff() 도 같은 방식이다.
         copter.set_auto_armed(true);
 
-        // 이륙 시퀀스가 시작됐다.  이 뒤로는 정착 대기 조건을 보지 않는다.
         _takeoff_started = true;
-        gcs().send_text(MAV_SEVERITY_INFO, "%s: takeoff to %.1fm", name(),
-                        (double)(_takeoff_alt * 0.01f));
+        gcs().send_text(MAV_SEVERITY_INFO, "%s: takeoff to %.1fm", name(), (double)(_takeoff_alt * 0.01f));
     }
 
-    // 이륙 제어.  complete 가 true 가 된 뒤에도 계속 호출하면 목표 고도와
-    // 제자리(XY 속도 0)를 유지하므로 그대로 호버링한다.
     auto_takeoff.run();
 
-    // 완료 판정: 목표 고도에 도달해야 5번으로 넘어갈 수 있다
     _state_done = auto_takeoff.complete;
 }
 
 void ModeTDCN::state_flight_wait()      // 5 비행 대기
 {
-    // 완료 판정: 호버 유지 상태라 언제든 추종을 시작할 수 있다
     _state_done = true;
 
     if (_state_entered) {
-        // --- 유지할 위치 확정 ---
-        //
-        // state 4 의 이륙 완료 위치를 그대로 이어받는다.  이륙이 완료되지 않은
-        // 채로 넘어왔으면 completion pos 가 없으므로, 지금 컨트롤러가 추종 중인
-        // 목표(get_pos_desired_cm)를 쓴다.  현재 위치가 아니라 "추종 중인 목표"
-        // 를 쓰는 이유는 그래야 전환 순간에 목표가 튀지 않기 때문이다.
         if (!auto_takeoff.get_completion_pos(_hold_pos_neu_cm)) {
             _hold_pos_neu_cm = pos_control->get_pos_desired_cm();
         }
+        
+        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(), wp_nav->get_wp_acceleration());
+        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(), wp_nav->get_wp_acceleration());
+        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(), wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
+        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(), wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
 
-        // 속도 / 가속 한계.  ModeGuided::pva_control_start() 와 같은 값이다.
-        // Z 는 state 4 에서 이륙 속도(느림)로 좁혀 두었으므로 여기서 기본값으로
-        // 되돌려 고도 보정 여력을 회복시킨다.
-        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                           wp_nav->get_wp_acceleration());
-        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                                   wp_nav->get_wp_acceleration());
-        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(),
-                                           wp_nav->get_default_speed_up(),
-                                           wp_nav->get_accel_z());
-        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(),
-                                                  wp_nav->get_default_speed_up(),
-                                                  wp_nav->get_accel_z());
-
-        // 이미 활성인 컨트롤러는 다시 초기화하지 않는다 (state 4 의 이륙 위치를 이어받는다).
         if (!pos_control->is_active_xy()) {
             pos_control->init_xy_controller();
         }
@@ -686,7 +599,6 @@ void ModeTDCN::state_flight_wait()      // 5 비행 대기
         auto_yaw.set_mode(AutoYaw::Mode::HOLD);
     }
 
-    // 무장 전이거나 착지 상태면 제어하지 않는다
     if (is_disarmed_or_landed()) {
         make_safe_ground_handling();
         return;
@@ -694,35 +606,24 @@ void ModeTDCN::state_flight_wait()      // 5 비행 대기
 
     motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
 
-    // 이륙한 위치와 고도를 계속 유지한다 (XY, Z 모두)
     pos_control->input_pos_xyz(_hold_pos_neu_cm, 0.0f, 0.0f);
 
     pos_control->update_xy_controller();
     pos_control->update_z_controller();
 
-    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(),
-                                                  auto_yaw.get_heading());
+    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(), auto_yaw.get_heading());
 }
 
 void ModeTDCN::state_tracking()         // 6 추종 비행
 {
-    // 완료 판정: 추종을 언제 끝낼지는 조작자가 정한다
     _state_done = true;
 
     if (_state_entered) {
-        // 속도 / 가속 한계 (ModeGuided::pva_control_start() 와 동일)
-        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                           wp_nav->get_wp_acceleration());
-        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                                   wp_nav->get_wp_acceleration());
-        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(),
-                                           wp_nav->get_default_speed_up(),
-                                           wp_nav->get_accel_z());
-        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(),
-                                                  wp_nav->get_default_speed_up(),
-                                                  wp_nav->get_accel_z());
+        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(), wp_nav->get_wp_acceleration());
+        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(), wp_nav->get_wp_acceleration());
+        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(), wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
+        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(), wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
 
-        // 이미 활성인 컨트롤러는 재초기화하지 않는다 (state 5 에서 이어받는다)
         if (!pos_control->is_active_xy()) {
             pos_control->init_xy_controller();
         }
@@ -730,17 +631,11 @@ void ModeTDCN::state_tracking()         // 6 추종 비행
             pos_control->init_z_controller();
         }
 
-        // 타겟 변환이 실패했을 때 쓸 안전 초기값.  0 으로 두면 EKF origin 으로
-        // 날아가므로, 지금 추종 중인 목표를 넣어 제자리 유지가 되게 한다.
         _track_pos_neu_cm = pos_control->get_pos_desired_cm();
     }
 
-    // --- CLAW 실행 ----------------------------------------------------------
-    // 매 루프 돌린다.  TDCN_CLAW_ON_OFF 가 1 이면 이 출력이 output_to_motors() 에서
-    // 믹서 입력을 대체하고, 0 이면 계산만 하고 쓰이지 않는다.
     Run_CLAW();
 
-    // --- 기체 제어: 아두파일럿 위치제어로 GCS 타겟 추종 ----------------------
     if (is_disarmed_or_landed()) {
         make_safe_ground_handling();
         return;
@@ -748,24 +643,18 @@ void ModeTDCN::state_tracking()         // 6 추종 비행
 
     motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
 
-    // GCS 타겟 -> EKF origin 기준 NEU cm.
-    // _target_loc 이 int32 위경도 + AltFrame 을 그대로 들고 있으므로 여기서는
-    // 변환만 한다 (부동소수 왕복이 없어 cm 정밀도가 유지된다).
     Vector3f target_neu_cm;
     if (_target_loc.get_vector_from_origin_NEU(target_neu_cm)) {
         _track_pos_neu_cm = target_neu_cm.topostype();
     }
-    // 변환 실패(EKF origin 미설정)면 마지막 목표를 유지한다
 
     pos_control->input_pos_xyz(_track_pos_neu_cm, 0.0f, 0.0f);
     pos_control->update_xy_controller();
     pos_control->update_z_controller();
 
-    // 타겟 heading 을 향한다 (CLAW 도 같은 Ship_heading 을 추종한다).
     auto_yaw.set_yaw_angle_rate(_target_heading_deg, 0.0f);
 
-    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(),
-                                                  auto_yaw.get_heading());
+    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(), auto_yaw.get_heading());
 
     if (claw_output_active()) {
         attitude_control->reset_target_and_rate(false);
@@ -775,42 +664,25 @@ void ModeTDCN::state_tracking()         // 6 추종 비행
 
 void ModeTDCN::state_landing_wait()     // 7 착륙 대기
 {
-    // 완료 판정: 호버 유지 상태라 언제든 하강할 수 있다
     _state_done = true;
 
     if (_state_entered) {
-        // 속도 / 가속 한계 (ModeGuided::pva_control_start() 와 동일)
-        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                           wp_nav->get_wp_acceleration());
-        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                                   wp_nav->get_wp_acceleration());
-        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(),
-                                           wp_nav->get_default_speed_up(),
-                                           wp_nav->get_accel_z());
-        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(),
-                                                  wp_nav->get_default_speed_up(),
-                                                  wp_nav->get_accel_z());
+        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(), wp_nav->get_wp_acceleration());
+        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(), wp_nav->get_wp_acceleration());
+        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(), wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
+        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(), wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
 
-        // --- CLAW -> 아두파일럿 인수인계 ---
-        //
-        // 조건 없이 다시 초기화한다.  CLAW 가 몰던 동안 pos_control 의 목표는
-        // 낡아 있으므로 그것을 이어받으면 안 된다.  현재 위치 / 속도에서
-        // 계산한 정지점을 새 목표로 삼는다.
         pos_control->init_xy_controller_stopping_point();
         pos_control->init_z_controller_stopping_point();
 
-        // CLAW 가 만든 자세를 쫓느라 쌓인 적분항을 비우고, yaw 목표를 현재
-        // 자세로 맞춘다.  이걸 안 하면 인계 직후 자세가 요동친다.
         attitude_control->reset_rate_controller_I_terms();
         attitude_control->reset_yaw_target_and_rate();
 
         auto_yaw.set_mode(AutoYaw::Mode::HOLD);
 
-        // 위에서 계산된 정지점을 유지 목표로 잡는다
         _hold_pos_neu_cm = pos_control->get_pos_desired_cm();
     }
 
-    // --- 기체 제어: 정지점 유지 (CLAW 는 여기서 돌지 않는다) ---
     if (is_disarmed_or_landed()) {
         make_safe_ground_handling();
         return;
@@ -823,32 +695,19 @@ void ModeTDCN::state_landing_wait()     // 7 착륙 대기
     pos_control->update_xy_controller();
     pos_control->update_z_controller();
 
-    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(),
-                                                  auto_yaw.get_heading());
+    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(), auto_yaw.get_heading());
 }
 
 void ModeTDCN::state_landing_sync()     // 8 착륙 동기
 {
     if (_state_entered) {
-        // XY 는 지금 추종 중인 목표를 그대로 이어받는다 (그 자리 유지).
-        // Z 는 아래에서 매 루프 목표 고도로 덮어쓴다.
         _hold_pos_neu_cm = pos_control->get_pos_desired_cm();
 
-        // XY 한계는 기본값, Z 하강 속도만 따로 준다.
-        // 하강 속도를 제한하는 이유는 착륙 준비 단계에서 급강하를 막기 위함이다.
-        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                           wp_nav->get_wp_acceleration());
-        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                                   wp_nav->get_wp_acceleration());
-        pos_control->set_max_speed_accel_z(-_land_spd,
-                                           wp_nav->get_default_speed_up(),
-                                           wp_nav->get_accel_z());
-        pos_control->set_correction_speed_accel_z(-_land_spd,
-                                                  wp_nav->get_default_speed_up(),
-                                                  wp_nav->get_accel_z());
+        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(), wp_nav->get_wp_acceleration());
+        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(), wp_nav->get_wp_acceleration());
+        pos_control->set_max_speed_accel_z(-_land_spd, wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
+        pos_control->set_correction_speed_accel_z(-_land_spd, wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
 
-        // 이미 활성인 컨트롤러는 재초기화하지 않는다.  state 7 이 정지점을
-        // 잡아둔 상태로 들어오므로 그것을 이어받아야 목표가 튀지 않는다.
         if (!pos_control->is_active_xy()) {
             pos_control->init_xy_controller();
         }
@@ -863,13 +722,11 @@ void ModeTDCN::state_landing_sync()     // 8 착륙 동기
     sync_loc.set_alt_cm((int32_t)_land_alt, Location::AltFrame::ABOVE_HOME);
     Vector3f sync_neu_cm;
     if (sync_loc.get_vector_from_origin_NEU(sync_neu_cm)) {
-        _hold_pos_neu_cm.z = sync_neu_cm.z;     // XY 는 건드리지 않는다
+        _hold_pos_neu_cm.z = sync_neu_cm.z;   
     }
 
-    // 완료 판정: 착륙 준비 고도에 도달해야 9번으로 넘어갈 수 있다
     _state_done = fabsf((float)copter.current_loc.alt - _land_alt) < 50.0f;
 
-    // --- 기체 제어 ---
     if (is_disarmed_or_landed()) {
         make_safe_ground_handling();
         return;
@@ -882,47 +739,34 @@ void ModeTDCN::state_landing_sync()     // 8 착륙 동기
     pos_control->update_xy_controller();
     pos_control->update_z_controller();
 
-    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(),
-                                                  auto_yaw.get_heading());
+    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(), auto_yaw.get_heading());
 }
 
 void ModeTDCN::state_landing_stow()     // 9 착륙 수납
 {
-    // 완료 판정: 착지 감지가 떠야 10번(disarm)으로 넘어갈 수 있다.
-    // 이게 없으면 공중에서 disarm 을 시도하게 된다.
     _state_done = copter.ap.land_complete;
 
     if (_state_entered) {
-        // ModeLand::init() 과 같은 순서 / 같은 값
-        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                           wp_nav->get_wp_acceleration());
-        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                                   wp_nav->get_wp_acceleration());
+        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(), wp_nav->get_wp_acceleration());
+        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(),  wp_nav->get_wp_acceleration());
 
         if (!pos_control->is_active_xy()) {
             pos_control->init_xy_controller();
         }
 
-        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(),
-                                           wp_nav->get_default_speed_up(),
-                                           wp_nav->get_accel_z());
-        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(),
-                                                  wp_nav->get_default_speed_up(),
-                                                  wp_nav->get_accel_z());
+        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(), wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
+        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(), wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
 
         if (!pos_control->is_active_z()) {
             pos_control->init_z_controller();
         }
 
-        // 조종자 재위치 / 정밀착륙 플래그 초기화 (ModeLand::init() 과 동일)
         copter.ap.land_repo_active = false;
         copter.ap.prec_land_active = false;
 
         auto_yaw.set_mode(AutoYaw::Mode::HOLD);
     }
 
-    // 착지했고 모터가 ground idle 이면 더 내려갈 곳이 없다.
-    // disarm 은 state 10 이 담당하므로 여기서는 안전 처리만 한다.
     if (is_disarmed_or_landed()) {
         make_safe_ground_handling();
         pos_control->relax_z_controller(0.0f);
@@ -936,12 +780,8 @@ void ModeTDCN::state_landing_stow()     // 9 착륙 수납
 
 void ModeTDCN::state_disarmed()         // 10 DISARMED
 {
-    // 완료 판정: 실제로 무장이 풀려야 11번으로 넘어갈 수 있다
     _state_done = !motors->armed();
 
-    // 무장 해제 상태를 "유지" 한다.  아직 무장돼 있으면 (착륙이 끝나지 않아
-    // disarm 이 거부됐거나, 어떤 이유로 다시 무장됐다면) 계속 시도한다.
-    // disarm() 은 체크를 돌리고 결과를 GCS 에 출력하므로 400Hz 로 부를 수 없다.
     if (!_state_done) {
         const uint32_t now_ms = AP_HAL::millis();
         if (_state_entered || (now_ms - _action_retry_ms) >= 1000) {
@@ -951,19 +791,12 @@ void ModeTDCN::state_disarmed()         // 10 DISARMED
     }
 
     if (_state_entered) {
-        // disarm 이 거부될 경우(아직 비행 중)를 대비해 호버 목표를 잡아둔다
         _hold_pos_neu_cm = pos_control->get_pos_desired_cm();
 
-        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                           wp_nav->get_wp_acceleration());
-        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(),
-                                                   wp_nav->get_wp_acceleration());
-        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(),
-                                           wp_nav->get_default_speed_up(),
-                                           wp_nav->get_accel_z());
-        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(),
-                                                  wp_nav->get_default_speed_up(),
-                                                  wp_nav->get_accel_z());
+        pos_control->set_max_speed_accel_xy(wp_nav->get_default_speed_xy(), wp_nav->get_wp_acceleration());
+        pos_control->set_correction_speed_accel_xy(wp_nav->get_default_speed_xy(), wp_nav->get_wp_acceleration());
+        pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(),wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
+        pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(), wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
 
         if (!pos_control->is_active_xy()) {
             pos_control->init_xy_controller();
@@ -976,13 +809,10 @@ void ModeTDCN::state_disarmed()         // 10 DISARMED
     }
 
     if (is_disarmed_or_landed()) {
-        // 정상 경로 - 지상에서 모터를 내리고 적분항 / yaw 목표를 리셋한다
         make_safe_ground_handling();
         return;
     }
 
-    // 아직 비행 중이다 = disarm 이 거부되었다는 뜻이다.
-    // 여기서 지상 처리를 하면 추락하므로, 제자리 호버를 유지한다.
     motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
 
     pos_control->input_pos_xyz(_hold_pos_neu_cm, 0.0f, 0.0f);
@@ -990,28 +820,22 @@ void ModeTDCN::state_disarmed()         // 10 DISARMED
     pos_control->update_xy_controller();
     pos_control->update_z_controller();
 
-    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(),
-                                                  auto_yaw.get_heading());
+    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(), auto_yaw.get_heading());
 }
 
 void ModeTDCN::state_hangar_close()     // 11 격납함 닫기
 {
-    // 마지막 단계 - 뒤가 없으므로 완료로 둔다
     _state_done = true;
 
-    // 지상 대기.  혹시 무장 상태로 들어와도 모터를 올리지 않는다.
     make_safe_ground_handling();
 }
 
 void ModeTDCN::state_auto_to_tracking() // 12 1~6 자동 진행
 {
-    // 다음 단계로 넘어갈지 먼저 정한다.  넘어가면 이번 루프에 그 단계의 state
-    // 함수가 진입 처리를 한다 (_state_entered 는 run() 끝에서 내려간다).
     auto_advance(State::TRACKING);
 
-    // 지금 단계의 state 함수를 그대로 부른다
     switch (_auto_step) {
-    case State::NONE:           preflight_vehicle_handling(); break;
+    case State::NONE:           make_safe_ground_handling(); break;
     case State::HANGAR_OPEN:    state_hangar_open();    break;  // 1
     case State::TAKEOFF_WAIT:   state_takeoff_wait();   break;  // 2
     case State::ARMED:          state_armed();          break;  // 3
@@ -1037,15 +861,8 @@ void ModeTDCN::state_auto_to_close()    // 13 6~11 자동 진행
     }
 }
 
-// ---------------------------------------------------------------------------
-/* 자동 진행 공통.  지금 단계가 TDCN_AUTO_DWELL 동안 계속 완료 상태면 다음 단계로 */
 void ModeTDCN::auto_advance(State end)
 {
-    // 완료되면 곧바로 넘기지 않는다.  완료 상태가 대기 시간 동안 계속 유지돼야
-    // 넘긴다 (예: 무장 직후 곧바로 이륙하지 않는다).  중간에 완료가 풀리면
-    // (예: 고도가 흔들림) 처음부터 다시 잰다.
-    // _state_done 은 직전 루프에 그 단계의 state 함수가 판정한 값이다.
-    // state 0 (NONE) 은 할 일이 없어 늘 완료로 본다.
     const bool done = (_auto_step == State::NONE) || _state_done;
     if (!done) {
         _auto_waiting = false;
@@ -1062,11 +879,8 @@ void ModeTDCN::auto_advance(State end)
         return;
     }
 
-    // --- 다음 단계로 ---
     const State next = (State)((uint8_t)_auto_step + 1);
     if (next == State::TRACKING) {
-        // 12 의 끝: 초기 목표 = 현재 상태 (위치 / 고도 / 헤딩).  제자리에서
-        // 추종을 시작하고, 이후 GCS 가 state 6 타겟을 보내면 그것을 따라간다.
         _target_loc = copter.current_loc;
         _target_heading_deg = degrees(ahrs.get_yaw());
     }
@@ -1078,7 +892,6 @@ void ModeTDCN::auto_advance(State end)
     gcs().send_text(MAV_SEVERITY_INFO, "%s: auto state %u", name(), (unsigned)next);
 
     if (next == end) {
-        // 끝 단계 도착 - 자동 진행을 끝내고, 다음 루프부터 그 state 로 일반 처리한다
         _state = next;
         gcs().send_text(MAV_SEVERITY_INFO, "%s: auto done (state %u)", name(), (unsigned)next);
     }
