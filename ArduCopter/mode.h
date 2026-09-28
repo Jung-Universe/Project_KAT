@@ -1829,8 +1829,8 @@ private:
 #if MODE_TDCN_ENABLED
 /* Sejong */
 // TDCN integrates the externally supplied CLAW controller
-// (mode_tdcn_CLAW_IBSC_ship_Fianl_NED.c).  Version 1 only monitors CLAW - its
-// control output is not applied to the vehicle.  Implementation: mode_tdcn.cpp
+// (mode_tdcn_CLAW_IBSC_ship_Fianl_NED.c).  With TDCN_CLAW_ON_OFF=1 the CLAW
+// output replaces the mixer inputs in state 6.  Implementation: mode_tdcn.cpp
 // (parameters: mode_tdcn_param.cpp, CLAW gains: mode_tdcn_gain.cpp)
 //
 // CLAW 제어기 게인.  정의는 mode_tdcn_gain.cpp (Part 2).
@@ -1962,7 +1962,7 @@ private:
     // 목표값 / 현재값 / 제어값을 _status 에 저장한다.
     void update_status();
 
-    // run() 2단계 - CLAW_U 에 기체 정보를 전달한다
+    // CLAW_U 에 기체 정보와 타겟을 넘긴다.  Run_CLAW() 가 부른다.
     void Update_Info_for_CLAW();
 
     // CLAW 한 스텝 (게인 반영 -> 입력 전달 -> CLAW_step).
@@ -2134,8 +2134,8 @@ private:
     AP_Float _land_alt;         // state 8 착륙 동기 고도 (cm, home 기준 up)
     AP_Float _land_spd;         // state 8 하강 속도 (cm/s)
 
-    // 0 = 아두파일럿이 몰고 CLAW 는 병렬 계산만 (v1)
-    // 1 = CLAW 의 제어값 4개를 믹서에 직접 넣는다 (v2)
+    // 0 = 아두파일럿이 몬다 (CLAW 는 state 6 에서 계산만 한다)
+    // 1 = state 6 에서 CLAW 의 제어값 4개로 믹서 입력을 대체한다
     AP_Int8  _claw_on_off;
 
     // 자동 진행 (GCS 명령 12 / 13) 에서 state 가 완료된 뒤 넘어가기까지 기다리는

@@ -13,7 +13,7 @@ volatile uint8_t Arming = 0;
 bool ModeTDCN::init(bool ignore_checks)
 {
     _state = State::NONE;
-    _gcs_cmd.pending = false;   // 모드 진입 전에 도착해 있던 명령은 버린다
+    _gcs_cmd.pending = false;
     _gcs_cmd.auto_pending = false;
     _auto_step = State::NONE;
     _auto_waiting = false;
@@ -420,7 +420,7 @@ void ModeTDCN::Update_Info_for_CLAW()
     XTV[1] =  (double)vel_neu_cms.y * 0.01;       // East  (m/s, E)
     XTV[2] = -(double)vel_neu_cms.z * 0.01;       // Down  (m/s, D)
 
-    // Current Position (MAV_CMD_USER_1)
+    // Current Position
     const Location &loc = copter.current_loc;
     CLAW_U.Cur_Pos.x = (double)loc.lat * 1.0e-7;    // 위도 (deg)
     CLAW_U.Cur_Pos.y = (double)loc.lng * 1.0e-7;    // 경도 (deg)
@@ -675,7 +675,7 @@ void ModeTDCN::state_flight_wait()      // 5 비행 대기
                                                   wp_nav->get_default_speed_up(),
                                                   wp_nav->get_accel_z());
 
-        // 이미 활성인 컨트롤러는 다시 초기화하지 않는다 (위 주석 1번).
+        // 이미 활성인 컨트롤러는 다시 초기화하지 않는다 (state 4 의 이륙 위치를 이어받는다).
         if (!pos_control->is_active_xy()) {
             pos_control->init_xy_controller();
         }
@@ -735,12 +735,9 @@ void ModeTDCN::state_tracking()         // 6 추종 비행
         _track_pos_neu_cm = pos_control->get_pos_desired_cm();
     }
 
-    // --- CLAW 병렬 실행 -----------------------------------------------------
-    // 기체 제어와 무관하게 매 루프 돌린다.  CLAW 가 받는 입력은 아두파일럿이
-    // 실제로 쓰는 것과 같은 값이므로, 로그를 비교하면 CLAW 를 판정할 수 있다.
-    //
-    //   Update_Info_for_CLAW()  IMU, EKF 속도, 현재 위치, 타겟 위치, 타겟 heading
-    //   CLAW_step()             CLAW 실행
+    // --- CLAW 실행 ----------------------------------------------------------
+    // 매 루프 돌린다.  TDCN_CLAW_ON_OFF 가 1 이면 이 출력이 output_to_motors() 에서
+    // 믹서 입력을 대체하고, 0 이면 계산만 하고 쓰이지 않는다.
     Run_CLAW();
 
     // --- 기체 제어: 아두파일럿 위치제어로 GCS 타겟 추종 ----------------------
@@ -764,8 +761,7 @@ void ModeTDCN::state_tracking()         // 6 추종 비행
     pos_control->update_xy_controller();
     pos_control->update_z_controller();
 
-    // 타겟 heading 을 향한다.  CLAW 도 ps_cmd = Ship_heading 을 추종하므로,
-    // 같은 heading 조건이어야 CLAW 의 yaw 채널을 공정하게 비교할 수 있다.
+    // 타겟 heading 을 향한다 (CLAW 도 같은 Ship_heading 을 추종한다).
     auto_yaw.set_yaw_angle_rate(_target_heading_deg, 0.0f);
 
     attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(),

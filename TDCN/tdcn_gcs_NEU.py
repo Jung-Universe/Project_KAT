@@ -27,12 +27,13 @@ COMMAND_INT 필드 매핑  (COMMAND_LONG 이 아니다!)
     z       float   Target Altitude    m, up-positive, home 기준
 
 이 스크립트는 SITL 테스트용이다.  기체는 frame 을 보고 NEU 를 위경도로 바꿔
-CLAW 와 위치제어에 넘긴다.  최종 결과물에서는 tdcn_gcs_Lat_Lon.py 를 쓰면 되고,
-기체 코드는 바꿀 필요가 없다.
+CLAW 와 위치제어에 넘긴다.  최종 결과물에서는 frame 을 3 (MAV_FRAME_GLOBAL_RELATIVE_ALT)
+으로 바꾸고 x/y 에 위경도 (int32, 1e7 deg) 를 실으면 되고, 기체 코드는 바꿀 필요가
+없다 (예: tdcn-v3 브랜치의 tdcn_gcs_Lat_Lon.py).
 
 Heading 은 진북(True North) 기준 deg 이다.  이 스크립트는 입력값을 정규화하지
 않고 그대로 전송한다 — 정규화(0~360 / ±180)나 rad 변환이 필요하면
-Target.as_params() 한 곳만 고치면 된다.
+Target.as_command_int_fields() 한 곳만 고치면 된다.
 
 ACK
 ---
@@ -57,19 +58,19 @@ state 도 0 으로 되돌린다.
 사용 예
 -------
     # 대화형 (기본)
-    ./tdcn_gcs.py
+    ./tdcn_gcs_NEU.py
 
     # 상태 하나만 보내고 종료
-    ./tdcn_gcs.py --state 3
+    ./tdcn_gcs_NEU.py --state 3
 
     # 타겟과 함께 추종 비행(state 6) 한 발
-    ./tdcn_gcs.py --state 6 --north 12.5 --east -4.0 --heading 90 --alt 20
+    ./tdcn_gcs_NEU.py --state 6 --north 12.5 --east -4.0 --heading 90 --alt 20
 
     # 위와 같으나 20초간 5Hz 로 스트리밍
-    ./tdcn_gcs.py --state 6 --north 12.5 --alt 20 --track 20
+    ./tdcn_gcs_NEU.py --state 6 --north 12.5 --alt 20 --track 20
 
     # 1~11 전체 시나리오 자동 재생
-    ./tdcn_gcs.py --scenario
+    ./tdcn_gcs_NEU.py --scenario
 
 주의: ArduPilot 에 MAV_CMD_USER_1 핸들러가 추가되기 전에는 기체가
 MAV_RESULT_UNSUPPORTED 로 응답한다.  이는 정상이며, 스크립트는 그 결과를

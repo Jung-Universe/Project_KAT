@@ -51,8 +51,8 @@ const AP_Param::GroupInfo ModeTDCN::var_info[] = {
 
     // @Param: CLAW_ON_OFF
     // @DisplayName: TDCN use CLAW control output
-    // @Description: 0 leaves ArduPilot flying the vehicle with CLAW running in parallel for monitoring only. 1 replaces the ArduPilot roll pitch yaw and throttle mixer inputs with the CLAW output during state 6 tracking. Only take off with 1 after the CLAW gains have been verified for this airframe.
-    // @Values: 0:ArduPilot flies CLAW monitors,1:CLAW flies
+    // @Description: 0 leaves ArduPilot flying the vehicle; CLAW still runs during state 6 but its output is not used. 1 replaces the ArduPilot roll pitch yaw and throttle mixer inputs with the CLAW output during state 6 tracking. Only take off with 1 after the CLAW gains have been verified for this airframe.
+    // @Values: 0:ArduPilot flies,1:CLAW flies
     // @User: Advanced
     AP_GROUPINFO("CLAW_ON_OFF", 5, ModeTDCN, _claw_on_off, 0),
 

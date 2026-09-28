@@ -446,7 +446,7 @@ void CLAW_step(void)
        -11 ~ +122 도로 돌면서 확인됐다:
            CTML  (정상)    잔차 0.6598
            CTML_inv(전치)  잔차 0.0007   <- 원본 코드가 이쪽
-       (검산: TDCV 의 CVN/CVE, CVU/CVV, PSI.  tdcn_log_compare.py 가 자동 판정한다)
+       (검산: v3 의 TDCV 로그 CVN/CVE, CVU/CVV, PSI 로 확인했다)
 
        원본:
            uv_des[0] = CTML_inv[0][0] * pos_dot_des[0] + CTML_inv[0][1] * pos_dot_des[1] + CTML_inv[0][2] * pos_dot_des[2];
