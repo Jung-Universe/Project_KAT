@@ -78,14 +78,6 @@ double G_mat[4][4], G_mat_inv[4][4];
 static double state_buffer[4][BUFFER_SIZE];
 static bool buffer_filled = false;
 
-/* Sejong: Estimate_Accel_Hermite() 안의 static 지역변수를 파일 전역으로 옮겼다.
-   함수 안에 있으면 부팅 후 한 번만 0 이라, TDCN 재진입 때 buffer_filled 만 false
-   로 내려도 카운트가 이미 차 있어 워밍업 없이 곧바로 미분을 시작한다.  그러면
-   진입 첫 스텝들의 각가속도가 (현재 각속도 - 이전 세션 마지막 각속도) / DT 로
-   튀어 ACCEL_LIMIT_ANGULAR 에 걸린다.  buffer_filled 와 함께 0 으로 되돌린다.
-   원본: Estimate_Accel_Hermite() 안의  static int init_count = 0;               */
-static int init_count = 0;
-
 // IBSC 안정화를 위한 게인 및 필터 계수 추가
 #define IBSC_DELTA_GAIN  0.1
 static double Est_Acc_Body_Filtered[6] = { 0.0, };
@@ -107,6 +99,7 @@ double Estimate_Accel_Hermite(int axis, double current_val, double dt) {
     state_buffer[axis][0] = current_val;
 
     if (!buffer_filled) {
+        static int init_count = 0;
         if (axis == 3) init_count++;
         if (init_count > BUFFER_SIZE + 5) buffer_filled = true;
         return 0.0;
@@ -178,7 +171,6 @@ void CLAW_step(void)
 
         for (int i = 0; i < 6; i++) Est_Acc_Body_Filtered[i] = 0.0;
         buffer_filled = false;
-        init_count = 0;     /* Sejong: 위 init_count 참고 */
         return;
     }
 
@@ -207,21 +199,11 @@ void CLAW_step(void)
             CLAW_DW.UD_DSTATE_i = 0.0;
             CLAW_DW.UD_DSTATE_p = 0.0;
 
-            /* Sejong: 각가속도 추정기 초기화.
-               init_count 를 함께 0 으로 되돌려 워밍업 (BUFFER_SIZE + 5 스텝) 을
-               다시 거치게 하고, 버퍼는 이번 스텝 입력으로 채운다.  STV[3..5] 는 이
-               아래에서 갱신되므로 여기서 읽으면 직전 스텝 (재진입이면 이전 세션의
-               마지막 스텝) 값이다.
-               원본:
-                   state_buffer[1][k] = STV[3];
-                   state_buffer[2][k] = STV[4];
-                   state_buffer[3][k] = STV[5];                                   */
             buffer_filled = false;
-            init_count = 0;
             for (int k = 0; k < BUFFER_SIZE; k++) {
-                state_buffer[1][k] = (double)CLAW_U.p;
-                state_buffer[2][k] = (double)CLAW_U.q;
-                state_buffer[3][k] = (double)CLAW_U.r;
+                state_buffer[1][k] = STV[3];
+                state_buffer[2][k] = STV[4];
+                state_buffer[3][k] = STV[5];
             }
             for (int k = 0; k < 6; k++) Est_Acc_Body_Filtered[k] = 0.0;
 
@@ -237,16 +219,6 @@ void CLAW_step(void)
                 ddXtraj[i] = 0.0;
                 Prev_CTRL[i] = 0.0;
             }
-
-            /* Sejong: 요 궤적은 현재 헤딩에서 출발시킨다.
-               Xtraj[3] 은 요 목표이고 0 은 진북이다.  0 으로 두면 이 스텝의 z1[3] 이
-               현재 헤딩 전체가 되어 cmd_yaw 가 포화한다 (진입 헤딩 121 도에서 1.0).
-               TDCN 이 CLAW_step() 뒤에 Xtraj[3] 을 고쳐 왔지만, 그때는 이 스텝의
-               출력이 이미 계산된 뒤라 잘못된 첫 출력이 한 루프 믹서로 나갔다.
-               STV[8] 은 아직 갱신 전이라 입력을 직접 읽는다 (아래 STV[8] 과 같은 식).
-               dXtraj[3] / ddXtraj[3] 은 위 for 문에서 0 이 됐다.                     */
-            Xtraj[3] = wrapToPi((double)CLAW_U.DR_heading_f.DR_heading);
-
             home_init = true;
         }
     }
@@ -446,7 +418,7 @@ void CLAW_step(void)
        -11 ~ +122 도로 돌면서 확인됐다:
            CTML  (정상)    잔차 0.6598
            CTML_inv(전치)  잔차 0.0007   <- 원본 코드가 이쪽
-       (검산: v3 의 TDCV 로그 CVN/CVE, CVU/CVV, PSI 로 확인했다)
+       (검산: TDCV 의 CVN/CVE, CVU/CVV, PSI.  tdcn_log_compare.py 가 자동 판정한다)
 
        원본:
            uv_des[0] = CTML_inv[0][0] * pos_dot_des[0] + CTML_inv[0][1] * pos_dot_des[1] + CTML_inv[0][2] * pos_dot_des[2];
@@ -540,23 +512,11 @@ void CLAW_step(void)
 
     f[0] = 0.0; f[1] = 0.0; f[2] = 0.0; f[3] = 0.0;
 
-    /* Sejong: 측정 가속도 Acc_0 의 부호 수정 (- -> +).
-       백스테핑 설계식은  G*Del = -k2*z2 - z1/q + alpha_dot - f  이고, f 자리에
-       측정 가속도를 쓴다.  아래 Del_Control = -G_inv * u_temp 이므로 u_temp 안에서는
-       +Acc_0 이어야 "이미 가속 중인 만큼 덜 미는" 상쇄가 된다.  -Acc_0 이면 가속하는
-       방향으로 더 밀어 양의 되먹임이 된다.  G 가 작은 요 (2.35) 에서 가장 크게 드러나
-       Gazebo 에서 요가 +-200 deg/s 로 포화하며 추력을 잃고 추락했다.
-       (Acc_0 는 STV 와 같은 축 / 부호의 실제 가속도다 - 위 Estimate_Accel_Hermite 참고)
-       Gazebo iris, CLAW_SCALE_Y 0.05 / CLAW_SCALE_TH 3.2 기준:
-           -Acc_0  요 182 deg/s, 스로틀 1~86% 요동
-           +Acc_0  고도 유지, 자세 +-1 deg, 요 RMS 11 deg/s
-       원본:
-           u_temp[i] = ... - alpha_dot[i] - Acc_0[i];   (i = 0..3)                 */
     double u_temp[4];
-    u_temp[0] = k2_gain[2] * z2[0] + z1[0] / q_gain[2] - alpha_dot[0] + Acc_0[0];
-    u_temp[1] = k2_gain[3] * z2[1] + z1[1] / q_gain[3] - alpha_dot[1] + Acc_0[1];
-    u_temp[2] = k2_gain[4] * z2[2] + z1[2] / q_gain[4] - alpha_dot[2] + Acc_0[2];
-    u_temp[3] = k2_gain[5] * z2[3] + z1[3] / q_gain[5] - alpha_dot[3] + Acc_0[3];
+    u_temp[0] = k2_gain[2] * z2[0] + z1[0] / q_gain[2] - alpha_dot[0] - Acc_0[0];
+    u_temp[1] = k2_gain[3] * z2[1] + z1[1] / q_gain[3] - alpha_dot[1] - Acc_0[1];
+    u_temp[2] = k2_gain[4] * z2[2] + z1[2] / q_gain[4] - alpha_dot[2] - Acc_0[2];
+    u_temp[3] = k2_gain[5] * z2[3] + z1[3] / q_gain[5] - alpha_dot[3] - Acc_0[3];
 
     Del_Control[0] = -1.0 * (G_mat_inv[0][0] * u_temp[0] + G_mat_inv[0][1] * u_temp[1] + G_mat_inv[0][2] * u_temp[2] + G_mat_inv[0][3] * u_temp[3]);
     Del_Control[1] = -1.0 * (G_mat_inv[1][0] * u_temp[0] + G_mat_inv[1][1] * u_temp[1] + G_mat_inv[1][2] * u_temp[2] + G_mat_inv[1][3] * u_temp[3]);
