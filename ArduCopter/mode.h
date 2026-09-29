@@ -1831,7 +1831,8 @@ private:
 // TDCN integrates the externally supplied CLAW controller
 // (mode_tdcn_CLAW_IBSC_ship_Fianl_NED.c).  With TDCN_CLAW_ON_OFF=1 the CLAW
 // output replaces the mixer inputs in state 6.  Implementation: mode_tdcn.cpp
-// (parameters: mode_tdcn_param.cpp, CLAW gains: mode_tdcn_gain.cpp)
+// (parameters: mode_tdcn_param.cpp, CLAW gains: mode_tdcn_gain.cpp,
+// logging: mode_tdcn_log.cpp)
 //
 // CLAW 제어기 게인.  정의는 mode_tdcn_gain.cpp (Part 2).
 //
@@ -1884,6 +1885,10 @@ public:
     // Part 2. CLAW 게인 파라미터 (mode_tdcn_gain.cpp).  ParametersG2 가 주소를
     // 잡아야 해서 public 이다.
     CLAW_Gains claw_gains;
+
+    // Part 3. 로그 (mode_tdcn_log.cpp).  스케줄러 fast task (Copter.cpp) 가 전원
+    // 인가부터 모드와 관계없이 매 루프 부른다.  그래서 public 이다.
+    void Log_Write_TDCN();
 
     // 믹서 직전 훅.  TDCN_CLAW_ON_OFF 가 1 이면 여기서 아두파일럿이 계산한
     // 제어값을 CLAW 값으로 갈아끼운다.  Copter::motors_output() 이 부른다.
@@ -2134,6 +2139,15 @@ private:
     // 자동 진행 (GCS 명령 12 / 13) 에서 state 가 완료된 뒤 넘어가기까지 기다리는
     // 시간 (s).  완료 상태가 이 시간 동안 계속 유지돼야 다음 state 로 넘어간다.
     AP_Float _auto_dwell;
+
+    // Part 3 로그 (TDIM / TDST / TDTG / TDMX) 의 기록 주기 (Hz).  0 = 기록 안 함.
+    AP_Int16 _log_hz;
+
+    // ----- Part 3. 로그 (TDIM / TDST / TDTG / TDMX)  mode_tdcn_log.cpp -------
+    //
+    // Log_Write_TDCN() (public) 이 TDCN_LOG_HZ 주기로 전원 인가부터 모드와 관계없이
+    // 남긴다.  LOG_DISARMED 와 관계없이 무장 해제 중에도 기록한다.
+    uint16_t _log_count;        // 주기 맞추는 루프 카운터
 };
 #endif
 

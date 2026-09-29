@@ -65,6 +65,14 @@ const AP_Param::GroupInfo ModeTDCN::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("AUTO_DWELL", 6, ModeTDCN, _auto_dwell, 3.0f),
 
+    // @Param: LOG_HZ
+    // @DisplayName: TDCN log rate
+    // @Description: Rate of the TDIM, TDST, TDTG and TDMX log messages, written from power on in every flight mode so that the reset on TDCN re-entry can be seen. The main loop rate (SCHED_LOOP_RATE) is divided by a whole number, so with a 400 Hz loop 400, 200, 100, 80 and 50 are exact. When not 0 the vehicle also logs while disarmed, regardless of LOG_DISARMED. 0 turns off both.
+    // @Units: Hz
+    // @Range: 0 400
+    // @User: Advanced
+    AP_GROUPINFO("LOG_HZ", 7, ModeTDCN, _log_hz, 400),
+
     AP_GROUPEND
 };
 // ---------------------------------------------------------------------------

@@ -43,6 +43,10 @@ bool ModeTDCN::init(bool ignore_checks)
     _armed_prev = motors->armed();
     _takeoff_started = false;
 
+    _hold_pos_neu_cm.zero();
+    _track_pos_neu_cm.zero();
+    _takeoff_target_neu_cm.zero();
+
     _status = TdcnStatus{};
 
     Arming = 1;
@@ -56,6 +60,11 @@ bool ModeTDCN::init(bool ignore_checks)
 void ModeTDCN::exit()
 {
     Arming = 0;
+
+    // 로그상 TDCN 밖은 전원 인가 직후처럼 0 으로 보이게 한다 (TDST / TDTG / TDMX)
+    _state = State::NONE;
+    _auto_step = State::NONE;
+    _status = TdcnStatus{};
 }
 // ---------------------------------------------------------------------------
 

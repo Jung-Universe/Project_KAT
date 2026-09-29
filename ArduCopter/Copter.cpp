@@ -122,6 +122,12 @@ const AP_Scheduler::Task Copter::scheduler_tasks[] = {
 #endif //HELI_FRAME
     // send outputs to the motors library immediately
     FAST_TASK(motors_output),
+#if MODE_TDCN_ENABLED
+    /* Sejong */
+    // TDCN 로그 (Part 3).  전원 인가부터 모드와 관계없이 매 루프.  믹서에 들어간
+    // 값을 보려고 motors_output 바로 다음, update_flight_mode (run) 전에 둔다.
+    FAST_TASK_CLASS(ModeTDCN, &copter.mode_tdcn, Log_Write_TDCN),
+#endif
      // run EKF state estimator (expensive)
     FAST_TASK(read_AHRS),
 #if FRAME_CONFIG == HELI_FRAME
