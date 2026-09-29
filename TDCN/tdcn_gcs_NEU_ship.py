@@ -91,9 +91,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 #  설정 — 여기만 고치면 된다 (CLI 인자로도 덮어쓸 수 있다)
 # ===========================================================================
 
-#: 배가 지나는 궤적.  (dNorth, dEast) 숫자쌍, m.
-#: **직전 위치로부터의 변위** 다 (절대 좌표가 아니다).  순서대로 누적된다.
-#: 두 값을 동시에 주면 대각선으로 간다 — 예: (3, 3) 이면 북동쪽 45도로 4.24m.
+#: 배가 지나는 궤적 [m]
 traj_NE = [
     (+30.0,   0.0),     
     (  0.0, +30.0),     
@@ -101,17 +99,17 @@ traj_NE = [
     (  0.0, -30.0),     
 ]
 
-#: 고도 오프셋 (m).  궤적 내내 일정하다.
+#: 고도 오프셋 (m)
 traj_U = 15.0
 
-#: 배의 속도 (m/s).  웨이포인트 사이를 이 속도로 지난다.
-SHIP_SPEED_MPS = 1.0
+#: 배의 속도 (m/s)
+SHIP_SPEED_MPS = 5.0
 
-#: 배가 자기 상태(위치/헤딩)를 갱신하는 주기 (Hz).  궤적 해상도.
+#: 배가 자기 상태(위치/헤딩)를 갱신하는 주기 (Hz)
 SHIP_UPDATE_RATE_HZ = 400.0
 
-#: 텔레메트리로 FC 에 타겟을 보내는 주기 (Hz).
-TELEM_SEND_RATE_HZ = 50.0
+#: 텔레메트리로 FC 에 타겟을 보내는 주기 (Hz)
+TELEM_SEND_RATE_HZ = 10.0
 
 #: 배의 출발 위치 (m, home 기준)
 SHIP_START_NORTH = 0.0
@@ -372,6 +370,14 @@ def print_table(ship: Ship, update_rate: float, send_rate: float,
 # 플롯
 # ---------------------------------------------------------------------------
 
+# 글자 — 모두 굵게 (_setup_mpl).  크기는 여기서 한 번에 바꾼다
+FS_TITLE = 15       # 그림 제목 (suptitle)
+FS_LABEL = 14       # 축 이름 (x / y), 컬러바
+FS_TICK = 12        # 눈금 숫자
+FS_LEGEND = 11      # 범례
+FS_NOTE = 12        # 그림 안 글씨 (웨이포인트 번호)
+
+
 def _setup_mpl():
     import matplotlib.pyplot as plt
     from matplotlib import font_manager as fm
@@ -380,7 +386,15 @@ def _setup_mpl():
         if any(f.name == cand for f in fm.fontManager.ttflist):
             plt.rcParams["font.family"] = cand
             break
-    plt.rcParams["axes.unicode_minus"] = False
+    plt.rcParams.update({
+        "axes.unicode_minus": False,
+        "font.weight": "bold",
+        "axes.labelweight": "bold",
+        "axes.titleweight": "bold",
+        "figure.titleweight": "bold",
+        "xtick.labelsize": FS_TICK,
+        "ytick.labelsize": FS_TICK,
+    })
     return plt
 
 
@@ -431,10 +445,10 @@ def plot_path(ship: Ship, update_rate: float, send_rate: float,
     me = [m[3] for m in msgs]
     mh = [m[4] for m in msgs]
 
-    fig, ax = plt.subplots(figsize=(8.6, 7.6))
-    fig.suptitle(f"[Figure 1] 설정 웨이포인트 기반 2D 궤적  —  "
-                 f"{ship.length:.1f}m @ {ship.speed:g}m/s = {ship.duration:.1f}s",
-                 fontsize=12)
+    fig, ax = plt.subplots(figsize=(10.0, 9.0))
+    fig.suptitle(f"[Figure 1] 배 궤적  —  "
+                 f"{ship.length:.1f} m, {ship.speed:g} m/s, {ship.duration:.1f} s",
+                 fontsize=FS_TITLE)
 
     # --- 기준 경로 : 시간으로 색칠 (겹치는 왕복 구간을 구분하기 위해) ---
     pts = np.array([es, ns]).T.reshape(-1, 1, 2)
@@ -444,7 +458,7 @@ def plot_path(ship: Ship, update_rate: float, send_rate: float,
     lc.set_array(np.array(ts[:-1]))
     ax.add_collection(lc)
     cb = fig.colorbar(lc, ax=ax, pad=0.02, fraction=0.045)
-    cb.set_label("경과 시간 (s)", fontsize=9)
+    cb.set_label("경과 시간 (s)", fontsize=FS_LABEL)
 
     # --- 웨이포인트 : 겹치는 점은 번호를 합쳐 표시한다 ---
     seen: dict[tuple[float, float], list[int]] = {}
@@ -453,33 +467,29 @@ def plot_path(ship: Ship, update_rate: float, send_rate: float,
     pn = [p[0] for p in ship.points]
     pe = [p[1] for p in ship.points]
     ax.plot(pe, pn, "s", color="#222222", ms=12, mfc="none", mew=1.8,
-            label=f"설정한 웨이포인트 (traj_NE, {len(ship.points)}개)", zorder=6)
+            label="웨이포인트", zorder=6)
     for (n, e), idxs in seen.items():
         ax.annotate(",".join(str(k) for k in idxs), (e, n),
                     textcoords="offset points", xytext=(11, 8),
-                    fontsize=10, color="#222222", zorder=7,
+                    fontsize=FS_NOTE, color="#222222", zorder=7,
                     fontweight="bold")
 
     ax.plot(ship.e0, ship.n0, "o", color="#2ca02c", ms=13,
-            label="출발점 (t=0)", zorder=8)
+            label="출발", zorder=8)
     ax.plot(ship.points[-1][1], ship.points[-1][0], "X", color="#d62728",
-            ms=12, label=f"도착점 (t={ship.duration:.0f}s, 이후 계속 호버)",
-            zorder=8)
+            ms=12, label="도착", zorder=8)
 
     # --- 전송 지점 : 드론이 실제로 받은 타겟 ---
     ax.plot(me, mn, "o", color="#d62728", ms=4.5, alpha=0.9,
-            label=f"텔레메트리로 실제 보낸 타겟 N/E "
-                  f"({send_rate:g}Hz, {len(msgs)}발)", zorder=5)
+            label=f"전송 ({send_rate:g} Hz)", zorder=5)
 
     ax.set_aspect("equal", adjustable="datalim")
     ax.margins(0.12)
-    ax.set_xlabel("East (m)")
-    ax.set_ylabel("North (m)")
-    ax.set_title(f"선 = 배가 지나는 연속 경로 (색 = 경과시간, 겹친 왕복 구간 "
-                 f"구분용)   |   Heading 은 Figure 2 참조", fontsize=9)
+    ax.set_xlabel("East (m)", fontsize=FS_LABEL)
+    ax.set_ylabel("North (m)", fontsize=FS_LABEL)
     ax.grid(alpha=0.3)
-    ax.legend(fontsize=8, loc="best")
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    ax.legend(fontsize=FS_LEGEND, loc="best")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
 
     if save:
         out = _save_name(save, 1)
@@ -522,17 +532,14 @@ def plot_targets(ship: Ship, update_rate: float, send_rate: float,
 
     # 순서: N, E, Heading, U
     rows = (
-        ("North (m)",          un, mn, "#1f77b4"),
-        ("East (m)",           ue, me, "#9467bd"),
-        ("Heading (deg, 진북)", uh, mh, "#ff7f0e"),
-        ("Up / Alt 오프셋 (m)", ua, ma, "#2ca02c"),
+        ("North (m)",     un, mn, "#1f77b4"),
+        ("East (m)",      ue, me, "#9467bd"),
+        ("Heading (deg)", uh, mh, "#ff7f0e"),
+        ("Up (m)",        ua, ma, "#2ca02c"),
     )
 
-    fig, axes = plt.subplots(4, 1, figsize=(12, 10.5), sharex=True)
-    fig.suptitle(f"[Figure 2] 축별 명령값  —  배 상태 계산 {update_rate:g}Hz "
-                 f"({len(ut)}개) / 텔레메트리 전송 {send_rate:g}Hz "
-                 f"({sum(1 for t in mt if t <= ship.duration + 1e-9)}개)",
-                 fontsize=12)
+    fig, axes = plt.subplots(4, 1, figsize=(14.0, 11.5), sharex=True)
+    fig.suptitle("[Figure 2] 축별 명령값", fontsize=FS_TITLE)
 
     small = 3 if len(ut) <= 500 else 1.6
     big = 6 if len(mt) <= 80 else 3
@@ -540,22 +547,22 @@ def plot_targets(ship: Ship, update_rate: float, send_rate: float,
     for ax, (label, uy, my, color) in zip(axes, rows):
         # 배가 계산한 상태 — 촘촘한 작은 점
         ax.plot(ut, uy, ".", color=color, ms=small, alpha=0.45,
-                label=f"배 계산 ({update_rate:g}Hz)", zorder=2)
+                label=f"계산 ({update_rate:g} Hz)", zorder=2)
         # 실제 전송값 — 계단 + 큰 점
         ax.step(mt, my, where="post", color=color, lw=1.6, alpha=0.9,
-                label=f"전송 ({send_rate:g}Hz)", zorder=3)
+                label=f"전송 ({send_rate:g} Hz)", zorder=3)
         ax.plot(mt, my, "o", color=color, ms=big, mfc="white", mew=1.4,
                 zorder=4)
 
-        ax.axvline(ship.duration, color="#888888", lw=1.0, ls="--", zorder=0)
-        ax.set_ylabel(label, fontsize=9)
+        # 궤적 끝.  이후는 마지막 값을 계속 전송한다
+        ax.axvline(ship.duration, color="#888888", lw=1.0, ls="--", zorder=0,
+                   label="궤적 끝")
+        ax.set_ylabel(label, fontsize=FS_LABEL)
         ax.grid(alpha=0.3)
-        ax.legend(fontsize=8, loc="upper right")
+        ax.legend(fontsize=FS_LEGEND, loc="upper right")
 
-    # 궤적 끝 표시는 세로 점선과 x축 라벨로 충분하다.  맨 위 패널에 주석을
-    # 달면 범례와 겹친다.
-    axes[-1].set_xlabel("t (s)   — 점선 = 궤적 끝, 이후는 마지막 값 계속 전송")
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    axes[-1].set_xlabel("t (s)", fontsize=FS_LABEL)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
 
     if save:
         out = _save_name(save, 2)
